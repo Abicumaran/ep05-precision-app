@@ -16,8 +16,7 @@ import statsmodels.formula.api as smf
 REQUIRED_BASE_COLS = ["batch_id", "Blood Sample ID", "Level", "Day", "Replicate", "Device"]
 BASE_COL_ALIASES = {
     "Blood Sample ID": ["Blood Sample ID", "bloodSampleId", "blood_sample_id", "sample_id"],
-    # Prefer the true device identifier over serial-number columns for UI filtering/grouping.
-    "Device": ["deviceID", "deviceId", "device_id", "DeviceID", "DeviceId", "Device ID", "Device", "serialNumber", "serial_number"],
+    "Device": ["Device", "deviceId", "device_id", "serialNumber", "serial_number"],
 }
 
 # User-specified device/reference pairs.  NEU is kept as the display analyte, while
@@ -50,9 +49,6 @@ NORMALIZATION_METHODS = [
     "Per-level median centering: reference only",
     "Per-level median centering: device and reference separately",
     "Reference drift correction: day-wise reference factors applied to paired values",
-    "Five-day reference drift correction: level-wise 5-day median target",
-    "Paired log-ratio bias drift correction: stabilize device/reference ratio by day",
-    "Combined paired correction: five-day reference + paired log-ratio",
     "Robust median/MAD z-score: reference only",
     "Robust median/MAD z-score: device and reference separately",
 ]
@@ -91,9 +87,8 @@ class Config:
     normalization_method: str = "Raw/no normalization"
     value_output_modes: List[str] = field(default_factory=lambda: ["Device normalized value"])
     analyte_pair_map: Dict[str, Tuple[str, str]] = field(default_factory=dict)
-    # Optional per-analyte override, populated by the normality-guided recommender.
-    # When present, each paired analyte can use its own best normalization method.
-    analyte_normalization_map: Dict[str, str] = field(default_factory=dict)
+    global_flag_col: Optional[str] = None
+    treat_all_global_false: bool = False
 
 
 # -----------------------------
@@ -109,25 +104,15 @@ def first_existing_column(df: pd.DataFrame, candidates) -> Optional[str]:
 
 
 def standardize_base_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Accept uploaded dataset aliases without requiring manual column edits.
-
-    Device handling intentionally prefers deviceID/deviceId over serialNumber.
-    Some source files contain both a serial-number column and a true deviceID column;
-    the app should display/filter by the true device ID.
-    """
+    """Accept the uploaded dataset aliases without requiring manual column edits."""
     out = df.copy()
     for canonical, aliases in BASE_COL_ALIASES.items():
-        found = first_existing_column(out, aliases)
-        if found is not None and (canonical not in out.columns or canonical == "Device"):
-            out[canonical] = out[found]
-
-    # Explicit final override for common true device-ID spellings, so an existing
-    # serial-based "Device" column cannot win over the true device identifier.
-    device_id_col = first_existing_column(out, ["deviceID", "deviceId", "device_id", "DeviceID", "DeviceId", "Device ID"])
-    if device_id_col is not None:
-        out["Device"] = out[device_id_col].astype(str)
-    elif "Device" in out.columns:
-        out["Device"] = out["Device"].astype(str)
+        if canonical not in out.columns:
+            found = first_existing_column(out, aliases)
+            if found is not None:
+                out[canonical] = out[found]
+    if "Device" not in out.columns and "deviceId" in out.columns:
+        out["Device"] = out["deviceId"].astype(str)
     return out
 
 
@@ -143,6 +128,62 @@ def resolve_analyte_pairs(df: pd.DataFrame, selected: Optional[List[str]] = None
         if dev_col is not None and ref_col is not None:
             pairs[label] = (dev_col, ref_col)
     return pairs
+
+
+def normalize_bool(value) -> bool:
+    if pd.isna(value):
+        return False
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if isinstance(value, (int, float, np.integer, np.floating)) and np.isfinite(value):
+        return bool(int(value))
+    return str(value).strip().lower() in {"true", "t", "1", "yes", "y", "flagged"}
+
+
+def split_global_flag_rows(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Exclude QC-rejected rows before normalization/statistics; keep them for a separate audit sheet."""
+    if cfg.treat_all_global_false or not cfg.global_flag_col or cfg.global_flag_col == "None":
+        return df.copy(), pd.DataFrame()
+    if cfg.global_flag_col not in df.columns:
+        raise ValueError(f"Selected global flag column '{cfg.global_flag_col}' was not found.")
+    mask = df[cfg.global_flag_col].map(normalize_bool).fillna(False).astype(bool)
+    return df.loc[~mask].copy(), df.loc[mask].copy()
+
+
+def default_analyte_mapping_table(df: pd.DataFrame) -> pd.DataFrame:
+    """Editable starter map: validated defaults plus additional PLT model columns when present."""
+    rows = []
+    base_pairs = resolve_analyte_pairs(df)
+    for label, (dev_col, ref_col) in base_pairs.items():
+        rows.append({"Include": True, "Analyte": label, "Device column": dev_col, "Reference column": ref_col})
+
+    # Requested additional platelet models share the same PLT reference column.
+    if "PLT_ref" in df.columns:
+        for suffix in ("2", "3"):
+            dev_col = f"PLT_{suffix}"
+            label = f"PLT {suffix}"
+            if dev_col in df.columns and not any(r["Device column"] == dev_col for r in rows):
+                rows.append({"Include": True, "Analyte": label, "Device column": dev_col, "Reference column": "PLT_ref"})
+    return pd.DataFrame(rows, columns=["Include", "Analyte", "Device column", "Reference column"])
+
+
+def parse_analyte_mapping_table(table: pd.DataFrame, df: pd.DataFrame) -> Dict[str, Tuple[str, str]]:
+    mapping = {}
+    if table is None or table.empty:
+        return mapping
+    for _, r in table.iterrows():
+        include = r.get("Include", True)
+        if pd.isna(include) or not bool(include):
+            continue
+        label = str(r.get("Analyte", "")).strip()
+        dev_col = str(r.get("Device column", "")).strip()
+        ref_col = str(r.get("Reference column", "")).strip()
+        if not label or not dev_col or not ref_col or dev_col == "nan" or ref_col == "nan":
+            continue
+        if dev_col not in df.columns or ref_col not in df.columns:
+            continue
+        mapping[label] = (dev_col, ref_col)
+    return mapping
 
 
 def safe_divide(num, den):
@@ -260,53 +301,12 @@ def apply_normalization_for_pair(df: pd.DataFrame, label: str, dev_col: str, ref
         norm_ref = ref - ref_center
 
     elif method == "Reference drift correction: day-wise reference factors applied to paired values":
-        # Backward-compatible legacy option: day-wise reference correction anchored to Day 1.
         tmp = out.assign(_ref=ref)
         day_center = group_day_medians(tmp, "_ref", level_day_cols)
         anchor = day1_anchor_by_level(out, ref)
         factor = safe_divide(anchor, day_center)
         norm_dev = dev * factor
         norm_ref = ref * factor
-
-    elif method == "Five-day reference drift correction: level-wise 5-day median target":
-        # Preferred absolute-value correction when the reference drifts over the 5-day EP05 run.
-        # This avoids over-anchoring to D1: each Level is corrected to its own 5-day reference median.
-        tmp = out.assign(_ref=ref)
-        day_center = group_day_medians(tmp, "_ref", level_day_cols)
-        target = tmp.groupby("Level")["_ref"].transform(lambda x: pd.to_numeric(x, errors="coerce").median())
-        factor = safe_divide(target, day_center)
-        norm_dev = dev * factor
-        norm_ref = ref * factor
-
-    elif method == "Paired log-ratio bias drift correction: stabilize device/reference ratio by day":
-        # Paired differential-drift correction. This directly stabilizes the device-vs-reference
-        # relationship across days using log(device/reference), while keeping the reference on
-        # its original clinical scale.
-        log_ratio = np.log(safe_divide(dev, ref))
-        tmp = out.assign(_lr=log_ratio)
-        day_lr = group_day_medians(tmp, "_lr", level_day_cols)
-        target_lr = tmp.groupby("Level")["_lr"].transform(lambda x: pd.to_numeric(x, errors="coerce").median())
-        ratio_factor = np.exp(target_lr - day_lr)
-        norm_dev = dev * ratio_factor
-        norm_ref = ref
-
-    elif method == "Combined paired correction: five-day reference + paired log-ratio":
-        # Best paired/longitudinal option when both the reference and device-reference bias drift.
-        # Step 1: stabilize reference day medians to the 5-day target within Level.
-        tmp = out.assign(_ref=ref)
-        day_center = group_day_medians(tmp, "_ref", level_day_cols)
-        target = tmp.groupby("Level")["_ref"].transform(lambda x: pd.to_numeric(x, errors="coerce").median())
-        ref_factor = safe_divide(target, day_center)
-        dev_refcorr = dev * ref_factor
-        ref_refcorr = ref * ref_factor
-        # Step 2: stabilize paired device/reference log-ratio across days.
-        log_ratio = np.log(safe_divide(dev_refcorr, ref_refcorr))
-        tmp_lr = out.assign(_lr=log_ratio)
-        day_lr = group_day_medians(tmp_lr, "_lr", level_day_cols)
-        target_lr = tmp_lr.groupby("Level")["_lr"].transform(lambda x: pd.to_numeric(x, errors="coerce").median())
-        ratio_factor = np.exp(target_lr - day_lr)
-        norm_dev = dev_refcorr * ratio_factor
-        norm_ref = ref_refcorr
 
     elif method == "Robust median/MAD z-score: reference only":
         med = group_day_medians(out.assign(_ref=ref), "_ref", level_cols)
@@ -333,14 +333,8 @@ def build_analysis_dataframe(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFram
     analysis_cols = []
     pair_rows = []
     for label, (dev_col, ref_col) in cfg.analyte_pair_map.items():
-        method_for_label = cfg.analyte_normalization_map.get(label, cfg.normalization_method)
-        work = apply_normalization_for_pair(work, label, dev_col, ref_col, method_for_label)
-        pair_rows.append({
-            "analyte": label,
-            "device_column": dev_col,
-            "reference_column": ref_col,
-            "normalization_method_used": method_for_label,
-        })
+        work = apply_normalization_for_pair(work, label, dev_col, ref_col, cfg.normalization_method)
+        pair_rows.append({"analyte": label, "device_column": dev_col, "reference_column": ref_col})
         for mode in cfg.value_output_modes:
             if mode == "Device normalized value":
                 analysis_cols.append(f"{label}__device_norm")
@@ -357,147 +351,8 @@ def build_analysis_dataframe(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFram
     return work, analysis_cols, pd.DataFrame(pair_rows)
 
 
-def paired_pctbias_residual_normality(df_method: pd.DataFrame, label: str) -> Dict[str, object]:
-    """Shapiro-Wilk normality check on paired %bias residuals after Level/Day adjustment.
-
-    The adjustment keeps the recommendation from confusing true Low/Mid/High level
-    differences or day blocks with residual distribution shape. If the OLS model fails
-    or the design is too small, it falls back to median-centered %bias.
-    """
-    out = {
-        "residual_shapiro_p": np.nan,
-        "residual_normality_pass_0_05": False,
-        "residual_n": 0,
-        "residual_model": "not_tested",
-    }
-    col = f"{label}__pctbias"
-    if col not in df_method.columns:
-        return out
-    dat = df_method[["Level", "Day", col]].copy()
-    dat[col] = pd.to_numeric(dat[col], errors="coerce")
-    dat = dat.replace([np.inf, -np.inf], np.nan).dropna(subset=[col])
-    if len(dat) < 3:
-        return out
-    try:
-        # Shapiro-Wilk in scipy is intended for n<=5000 for p-value accuracy.
-        model_dat = dat.rename(columns={col: "pctbias"})
-        if model_dat["Level"].nunique() >= 2 or model_dat["Day"].nunique() >= 2:
-            res = smf.ols("pctbias ~ C(Level) + C(Day)", data=model_dat).fit()
-            resid = np.asarray(res.resid, dtype=float)
-            out["residual_model"] = "OLS residuals: pctbias ~ C(Level) + C(Day)"
-        else:
-            vals = model_dat["pctbias"].to_numpy(dtype=float)
-            resid = vals - np.nanmedian(vals)
-            out["residual_model"] = "median-centered pctbias"
-    except Exception:
-        vals = dat[col].to_numpy(dtype=float)
-        resid = vals - np.nanmedian(vals)
-        out["residual_model"] = "fallback median-centered pctbias"
-
-    resid = resid[np.isfinite(resid)]
-    out["residual_n"] = int(len(resid))
-    if len(resid) >= 3:
-        try:
-            p = float(stats.shapiro(resid[:5000]).pvalue)
-            out["residual_shapiro_p"] = p
-            out["residual_normality_pass_0_05"] = bool(p >= 0.05)
-        except Exception:
-            pass
-    return out
-
-
-def make_normality_guided_recommendations(summary: pd.DataFrame) -> pd.DataFrame:
-    """Add per-analyte normalization recommendations using longitudinal paired drift metrics.
-
-    Normality is reported but is not used as the primary criterion for normalization.
-    The primary goal is paired longitudinal stability: low 5-day reference drift,
-    low 5-day device drift, and low drift/range in paired %bias.
-    """
-    if summary.empty:
-        return summary
-    combined_method = "Combined paired correction: five-day reference + paired log-ratio"
-    ref_5day_method = "Five-day reference drift correction: level-wise 5-day median target"
-    robust_method = "Robust median/MAD z-score: device and reference separately"
-    summary = summary.copy()
-    summary["normality_guided_recommended_for_analyte"] = False
-    summary["per_analyte_recommended_method"] = ""
-    summary["recommendation_reason"] = ""
-
-    for label, sub in summary.groupby("analyte"):
-        usable = sub.replace([np.inf, -np.inf], np.nan).dropna(subset=["normalization_score_lower_is_better"])
-        if usable.empty:
-            continue
-        # Robust z-score is a sensitivity check, not a primary clinical-scale paired normalization.
-        primary_usable = usable[~usable["normalization_method"].eq(robust_method)]
-        if primary_usable.empty:
-            primary_usable = usable
-        best_idx = primary_usable["normalization_score_lower_is_better"].idxmin()
-        chosen_idx = best_idx
-        chosen_method = str(summary.loc[chosen_idx, "normalization_method"])
-        reason = "Lowest longitudinal paired-drift score: combines reference/day CV, device/day CV, paired %bias slope, and paired %bias day-range. Shapiro-Wilk is reported for inference/outlier checks but does not drive normalization selection."
-
-        # Prefer the combined paired correction if it is competitive, because it handles both
-        # reference drift and differential device/reference bias drift without anchoring to Day 1.
-        combined_row = primary_usable[primary_usable["normalization_method"].eq(combined_method)]
-        if not combined_row.empty:
-            cidx = combined_row.index[0]
-            cscore = float(summary.loc[cidx, "normalization_score_lower_is_better"])
-            bscore = float(summary.loc[best_idx, "normalization_score_lower_is_better"])
-            if np.isfinite(cscore) and np.isfinite(bscore) and cscore <= 1.10 * bscore:
-                chosen_idx = cidx
-                chosen_method = combined_method
-                reason = "Combined paired correction recommended: it uses the 5-day reference median target plus paired log-ratio correction, so it handles both reference drift and differential device-vs-reference drift without Day-1 anchoring."
-
-        # If paired %bias is already stable and the issue is mainly absolute reference drift,
-        # the five-day reference correction is more conservative and keeps paired %bias unchanged.
-        ref_row = primary_usable[primary_usable["normalization_method"].eq(ref_5day_method)]
-        if not ref_row.empty and chosen_method != combined_method:
-            ridx = ref_row.index[0]
-            ref_score = float(summary.loc[ridx, "normalization_score_lower_is_better"])
-            best_score = float(summary.loc[chosen_idx, "normalization_score_lower_is_better"])
-            if np.isfinite(ref_score) and np.isfinite(best_score) and ref_score <= 1.10 * best_score:
-                chosen_idx = ridx
-                chosen_method = ref_5day_method
-                reason = "Five-day reference drift correction recommended: reference/day drift is the dominant issue and paired %bias does not need extra log-ratio correction."
-
-        summary.loc[chosen_idx, "normality_guided_recommended_for_analyte"] = True
-        summary.loc[summary["analyte"].eq(label), "per_analyte_recommended_method"] = chosen_method
-        summary.loc[summary["analyte"].eq(label), "recommendation_reason"] = reason
-
-    return summary
-
-def pctbias_day_drift_metrics(df_method: pd.DataFrame, label: str) -> Dict[str, float]:
-    col = f"{label}__pctbias"
-    if col not in df_method.columns:
-        return {"pctbias_day_slope_pp_per_day": np.nan, "pctbias_day_range_pp": np.nan}
-    dat = df_method[["Level", "Day", col]].copy()
-    dat[col] = pd.to_numeric(dat[col], errors="coerce")
-    dat = dat.replace([np.inf, -np.inf], np.nan).dropna(subset=[col])
-    slopes = []
-    ranges = []
-    for _, sub in dat.groupby("Level"):
-        med = sub.groupby("Day")[col].median()
-        # Sort D1..D5 numerically when possible.
-        day_nums = []
-        for d in med.index:
-            import re
-            m = re.search(r"\d+", str(d))
-            day_nums.append(int(m.group()) if m else np.nan)
-        tmp = pd.DataFrame({"day": day_nums, "bias": med.to_numpy(dtype=float)}).dropna()
-        if len(tmp) >= 2:
-            try:
-                slopes.append(float(stats.linregress(tmp["day"], tmp["bias"]).slope))
-            except Exception:
-                pass
-            ranges.append(float(tmp["bias"].max() - tmp["bias"].min()))
-    return {
-        "pctbias_day_slope_pp_per_day": float(np.nanmedian(np.abs(slopes))) if len(slopes) else np.nan,
-        "pctbias_day_range_pp": float(np.nanmedian(ranges)) if len(ranges) else np.nan,
-    }
-
 def evaluate_normalization_methods(df: pd.DataFrame, analyte_pair_map: Dict[str, Tuple[str, str]], methods: List[str]) -> pd.DataFrame:
     rows = []
-    normality_rows = []
     if not analyte_pair_map:
         return pd.DataFrame()
     base = standardize_base_columns(df)
@@ -505,12 +360,6 @@ def evaluate_normalization_methods(df: pd.DataFrame, analyte_pair_map: Dict[str,
         tmp = base.copy()
         for label, (dev_col, ref_col) in analyte_pair_map.items():
             tmp = apply_normalization_for_pair(tmp, label, dev_col, ref_col, method)
-            normality_rows.append({
-                "normalization_method": method,
-                "analyte": label,
-                **paired_pctbias_residual_normality(tmp, label),
-                **pctbias_day_drift_metrics(tmp, label),
-            })
             for level in sorted(tmp["Level"].dropna().astype(str).unique()):
                 sub = tmp[tmp["Level"].astype(str) == level]
                 if sub.empty:
@@ -564,11 +413,15 @@ def evaluate_normalization_methods(df: pd.DataFrame, analyte_pair_map: Dict[str,
 
     # Raw separation is the reference for distortion. Higher separation is better.
     raw_sep = sep_rows[sep_rows["normalization_method"] == "Raw/no normalization"].set_index("analyte")["min_level_center_separation"].to_dict() if not sep_rows.empty else {}
-    sep_rows["separation_preservation_ratio"] = sep_rows.apply(
-        lambda r: r.get("min_level_center_separation", np.nan) / raw_sep.get(r["analyte"], np.nan)
-        if raw_sep.get(r["analyte"], np.nan) not in [0, np.nan] else np.nan,
-        axis=1,
-    )
+
+    def _separation_ratio(r):
+        denom = raw_sep.get(r["analyte"], np.nan)
+        num = r.get("min_level_center_separation", np.nan)
+        if not np.isfinite(denom) or denom == 0 or not np.isfinite(num):
+            return np.nan
+        return float(num / denom)
+
+    sep_rows["separation_preservation_ratio"] = sep_rows.apply(_separation_ratio, axis=1)
     sep_summary = sep_rows.groupby(["normalization_method", "analyte"], as_index=False)["separation_preservation_ratio"].median()
 
     summary = metric_rows.groupby(["normalization_method", "analyte"], as_index=False).agg(
@@ -579,46 +432,29 @@ def evaluate_normalization_methods(df: pd.DataFrame, analyte_pair_map: Dict[str,
         iqr_pctbias=("IQR_%bias", "median"),
     )
     summary = summary.merge(sep_summary, on=["normalization_method", "analyte"], how="left")
-    normality_summary = pd.DataFrame(normality_rows)
-    if not normality_summary.empty:
-        summary = summary.merge(normality_summary, on=["normalization_method", "analyte"], how="left")
-    else:
-        summary["residual_shapiro_p"] = np.nan
-        summary["residual_normality_pass_0_05"] = False
-        summary["residual_n"] = 0
-        summary["residual_model"] = "not_tested"
 
     # Robust score: lower drift/CV/bias variation is better; preserving separation is rewarded.
-    # IMPORTANT: when the user selects only one Level, Low/Mid/High separation is not estimable.
-    # Older code propagated that NaN into the composite score, so every score could become NaN
-    # and pandas idxmin() raised: ValueError("Encountered all NA values").
-    # For single-level or otherwise non-estimable separation, use a neutral separation penalty of 0
-    # rather than failing the app.
-    sep_penalty = 100.0 * (1.0 - summary["separation_preservation_ratio"].clip(lower=0, upper=1))
-    sep_penalty = sep_penalty.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    # Some methods intentionally center or z-score data, so a CV denominator can become zero and produce all-NaN
+    # metrics.  Treat missing/non-finite score components as a large penalty instead of allowing idxmin() to crash.
+    def _clean_metric(series: pd.Series, fallback: float = 1000.0) -> pd.Series:
+        s = pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan)
+        finite = s[np.isfinite(s)]
+        fill = float(np.nanmedian(finite)) if len(finite) else fallback
+        return s.fillna(fill)
 
-    def _metric_component(col: str) -> pd.Series:
-        vals = pd.to_numeric(summary[col], errors="coerce").replace([np.inf, -np.inf], np.nan)
-        fallback = float(np.nanmedian(vals.to_numpy(dtype=float))) if vals.notna().any() else 0.0
-        return vals.fillna(fallback)
+    mid_ref = _clean_metric(summary["mid_ref_day_CV_pct"].fillna(summary["all_ref_day_CV_pct"]))
+    all_ref = _clean_metric(summary["all_ref_day_CV_pct"])
+    all_dev = _clean_metric(summary["all_device_day_CV_pct"])
+    bias_iqr = _clean_metric(summary["iqr_pctbias"])
+    sep_ratio = pd.to_numeric(summary["separation_preservation_ratio"], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    sep_penalty = 100.0 * (1.0 - sep_ratio.clip(lower=0, upper=1))
 
-    mid_or_all_ref_cv = pd.to_numeric(summary["mid_ref_day_CV_pct"], errors="coerce").replace([np.inf, -np.inf], np.nan)
-    mid_or_all_ref_cv = mid_or_all_ref_cv.fillna(pd.to_numeric(summary["all_ref_day_CV_pct"], errors="coerce"))
-    if mid_or_all_ref_cv.notna().any():
-        mid_or_all_ref_cv = mid_or_all_ref_cv.fillna(float(np.nanmedian(mid_or_all_ref_cv.to_numpy(dtype=float))))
-    else:
-        mid_or_all_ref_cv = mid_or_all_ref_cv.fillna(0.0)
-
-    # Paired longitudinal score. This now prioritizes the paired design: the best
-    # normalization is the one that stabilizes both absolute values and device-vs-reference
-    # %bias across all five days, not the one that merely gives normal residuals.
     summary["normalization_score_lower_is_better"] = (
-        0.25 * mid_or_all_ref_cv +
-        0.15 * _metric_component("all_ref_day_CV_pct") +
-        0.20 * _metric_component("all_device_day_CV_pct") +
-        0.20 * _metric_component("pctbias_day_slope_pp_per_day") +
-        0.15 * _metric_component("pctbias_day_range_pp") +
-        0.05 * sep_penalty
+        0.40 * mid_ref +
+        0.20 * all_ref +
+        0.15 * all_dev +
+        0.15 * bias_iqr +
+        0.10 * sep_penalty
     ).replace([np.inf, -np.inf], np.nan)
 
     summary["recommended_for_analyte"] = False
@@ -626,18 +462,19 @@ def evaluate_normalization_methods(df: pd.DataFrame, analyte_pair_map: Dict[str,
         score = pd.to_numeric(sub["normalization_score_lower_is_better"], errors="coerce").replace([np.inf, -np.inf], np.nan)
         if score.notna().any():
             idx = score.idxmin()
-        else:
-            # Last-resort fallback so the UI never crashes; raw is safest/most transparent.
-            raw = sub[sub["normalization_method"].eq("Raw/no normalization")]
-            idx = raw.index[0] if not raw.empty else sub.index[0]
-        summary.loc[idx, "recommended_for_analyte"] = True
+            summary.loc[idx, "recommended_for_analyte"] = True
 
     overall = summary.groupby("normalization_method", as_index=False).agg(
         overall_score_lower_is_better=("normalization_score_lower_is_better", "median"),
         recommended_analyte_count=("recommended_for_analyte", "sum"),
-    ).sort_values(["overall_score_lower_is_better", "recommended_analyte_count"], ascending=[True, False], na_position="last")
+    )
+    overall["overall_score_lower_is_better"] = pd.to_numeric(overall["overall_score_lower_is_better"], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    if overall["overall_score_lower_is_better"].isna().all():
+        overall["overall_score_lower_is_better"] = 1000.0
+    else:
+        overall["overall_score_lower_is_better"] = overall["overall_score_lower_is_better"].fillna(overall["overall_score_lower_is_better"].max() + 1000.0)
+    overall = overall.sort_values(["overall_score_lower_is_better", "recommended_analyte_count"], ascending=[True, False])
     summary = summary.merge(overall, on="normalization_method", how="left")
-    summary = make_normality_guided_recommendations(summary)
     return summary.sort_values(["overall_score_lower_is_better", "analyte", "normalization_score_lower_is_better"], na_position="last")
 
 
@@ -918,16 +755,11 @@ def compute_descriptive_ci(y: np.ndarray, normality_pass: bool, cfg: Config) -> 
     return out
 
 
-def normalization_method_for_analysis_column(analyte_col: str, cfg: Config) -> str:
-    base_label = str(analyte_col).split("__", 1)[0]
-    return cfg.analyte_normalization_map.get(base_label, cfg.normalization_method)
-
-
 def compute_ep05_components(df_group: pd.DataFrame, analyte: str, cfg: Config, expected_n_scope: int) -> Tuple[Dict, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     out = {"analyte": analyte}
     out["Level"] = str(df_group["Level"].iloc[0]) if len(df_group) else None
     out["Device"] = str(df_group["Device"].iloc[0]) if len(df_group) else None
-    out["normalization_method"] = normalization_method_for_analysis_column(analyte, cfg)
+    out["normalization_method"] = cfg.normalization_method
 
     y_raw = pd.to_numeric(df_group[analyte], errors="coerce").dropna()
     out["N_raw"] = int(len(y_raw))
@@ -1037,131 +869,168 @@ def make_boxplot_png(values: np.ndarray, title: str) -> bytes:
     return buf.getvalue()
 
 
-def run_pipeline_to_zip(df: pd.DataFrame, cfg: Config) -> bytes:
-    df_work, analysis_analytes, pair_table = build_analysis_dataframe(df, cfg)
-    df_f = df_work.copy()
-    df_f = df_f[df_f["Level"].astype(str).isin(cfg.levels)]
-    df_f = df_f[df_f["Day"].astype(str).isin(cfg.days)]
-    df_f = df_f[df_f["Device"].astype(str).isin(cfg.devices)]
-    df_f = df_f[df_f["Replicate"].astype(int).isin(cfg.replicates)]
+def _design_filter(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    out = standardize_base_columns(df)
+    if "Level" in out.columns:
+        out = out[out["Level"].astype(str).isin(cfg.levels)]
+    if "Day" in out.columns:
+        out = out[out["Day"].astype(str).isin(cfg.days)]
+    if "Device" in out.columns:
+        out = out[out["Device"].astype(str).isin([str(x) for x in cfg.devices])]
+    if "Replicate" in out.columns:
+        reps = pd.to_numeric(out["Replicate"], errors="coerce")
+        out = out[reps.isin(cfg.replicates)]
+    return out.copy()
+
+
+def _global_flag_audit(excluded: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    cols = ["batch_id", "bloodSampleId", "analyte"]
+    if excluded is None or excluded.empty:
+        return pd.DataFrame(columns=cols)
+    ex = _design_filter(excluded, cfg)
+    rows = []
+    for _, row in ex.iterrows():
+        batch = row.get("batch_id", "")
+        sample = row.get("Blood Sample ID", row.get("bloodSampleId", ""))
+        for label, (dev_col, ref_col) in cfg.analyte_pair_map.items():
+            if (dev_col in ex.columns and pd.notna(row.get(dev_col, np.nan))) or (ref_col in ex.columns and pd.notna(row.get(ref_col, np.nan))):
+                rows.append({"batch_id": batch, "bloodSampleId": sample, "analyte": label})
+        for analyte in cfg.analytes:
+            if analyte in ex.columns and pd.notna(row.get(analyte, np.nan)):
+                rows.append({"batch_id": batch, "bloodSampleId": sample, "analyte": analyte})
+    return pd.DataFrame(rows, columns=cols).drop_duplicates().reset_index(drop=True)
+
+
+def _format_results(summary: pd.DataFrame) -> pd.DataFrame:
+    if summary is None or summary.empty:
+        return pd.DataFrame()
+    out = summary.copy()
+    out.insert(0, "Analysis metric", out["analyte"].astype(str).str.split("__").str[1].fillna("raw") if "analyte" in out.columns else "")
+    out.insert(0, "Analyte", out["analyte"].astype(str).str.split("__").str[0] if "analyte" in out.columns else "")
+    preferred = [
+        "Level", "Analyte", "Analysis metric", "Device", "CV_total_%", "CV_repeat_%", "CV_between_day_%",
+        "shapiro_p", "normality_pass_0_05", "N_raw", "N_clean", "n_outliers", "expected_n",
+        "levene_p", "variance_pass_0_05", "statistical_branch", "method", "center_used", "center_value",
+        "mean", "sd_sample", "median", "IQR", "center_95CI_low", "center_95CI_high", "center_95CI_type",
+        "SD_repeat", "SD_between_day", "SD_total", "normalization_method", "outlier_method_requested",
+        "outlier_method_used", "max_outliers_allowed", "gcrit", "gcrit_mode", "gcrit_alpha", "gcrit_tail",
+        "modified_z_threshold", "robust_interval_z",
+    ]
+    ordered = [c for c in preferred if c in out.columns] + [c for c in out.columns if c not in preferred and c not in {"analyte"}]
+    return out[ordered]
+
+
+def _format_outliers(outlier_log: pd.DataFrame, analyzed_source: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    cols = ["analyte", "batch_id", "bloodSampleId", "mhs_value", "reference_value", "exclusion_reason"]
+    if outlier_log is None or outlier_log.empty:
+        return pd.DataFrame(columns=cols)
+    src = standardize_base_columns(analyzed_source)
+    rows = []
+    for _, r in outlier_log.iterrows():
+        metric_name = str(r.get("analyte", ""))
+        label = metric_name.split("__", 1)[0]
+        dev_col, ref_col = cfg.analyte_pair_map.get(label, (None, None))
+        batch = r.get("batch_id", "")
+        sample = r.get("Blood Sample ID", "")
+        candidates = src
+        if "batch_id" in candidates.columns and str(batch) != "":
+            candidates = candidates[candidates["batch_id"].astype(str) == str(batch)]
+        if "Blood Sample ID" in candidates.columns and str(sample) != "":
+            candidates = candidates[candidates["Blood Sample ID"].astype(str) == str(sample)]
+        rawrow = candidates.iloc[0] if len(candidates) else None
+        mhs = rawrow.get(dev_col, np.nan) if rawrow is not None and dev_col else r.get("value_removed", np.nan)
+        ref = rawrow.get(ref_col, np.nan) if rawrow is not None and ref_col else np.nan
+        reason = f"{r.get('outlier_method_used', '')}: {r.get('details', '')}".strip(": ")
+        rows.append({
+            "analyte": label,
+            "batch_id": batch,
+            "bloodSampleId": sample,
+            "mhs_value": mhs,
+            "reference_value": ref,
+            "exclusion_reason": reason,
+        })
+    return pd.DataFrame(rows, columns=cols)
+
+
+def run_pipeline_to_excel(df: pd.DataFrame, cfg: Config) -> bytes:
+    """Run the existing EP05 pipeline and return one audit-ready Excel workbook."""
+    eligible_raw, excluded_global = split_global_flag_rows(df, cfg)
+    df_work, analysis_analytes, pair_table = build_analysis_dataframe(eligible_raw, cfg)
+    df_f = _design_filter(df_work, cfg)
 
     df_f["Day"] = df_f["Day"].astype(str)
     df_f["Level"] = df_f["Level"].astype(str)
     df_f["Device"] = df_f["Device"].astype(str)
-    df_f["Replicate"] = df_f["Replicate"].astype(int)
+    df_f["Replicate"] = pd.to_numeric(df_f["Replicate"], errors="coerce").astype(int)
 
     all_rows = []
     all_outlier_logs = []
-    zip_buf = io.BytesIO()
-
-    def safe(s: str) -> str:
-        return str(s).replace(" ", "_").replace("/", "_").replace("%", "pct").replace("*", "x")
-
-    base_dir = "ep05_precision_results_NORMALIZATION_UPDATED"
-
     norm_comparison = evaluate_normalization_methods(df_f, cfg.analyte_pair_map, NORMALIZATION_METHODS)
 
-    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr(f"{base_dir}/analyte_pair_mapping.csv", pair_table.to_csv(index=False).encode("utf-8"))
-        zf.writestr(f"{base_dir}/normalization_method_comparison.csv", norm_comparison.to_csv(index=False).encode("utf-8"))
+    scope_tables = []
+    if cfg.device_mode == "Pool all devices":
+        pooled_df = df_f.copy(); pooled_df["Device"] = "pooled_all_devices"
+        scope_tables.append(("pooled_all_devices", pooled_df, len(cfg.days) * len(cfg.replicates) * len(cfg.devices)))
+    else:
+        pooled_df = df_f.copy(); pooled_df["Device"] = "pooled_all_devices"
+        scope_tables.append(("pooled_all_devices", pooled_df, len(cfg.days) * len(cfg.replicates) * len(cfg.devices)))
+        for device in cfg.devices:
+            scope_tables.append((str(device), df_f[df_f["Device"].astype(str) == str(device)].copy(), len(cfg.days) * len(cfg.replicates)))
 
-        if not norm_comparison.empty:
-            best_method = norm_comparison.sort_values("overall_score_lower_is_better").iloc[0]["normalization_method"]
-            per_analyte_recommendation = (
-                norm_comparison.loc[norm_comparison["normality_guided_recommended_for_analyte"].fillna(False)]
-                .sort_values("analyte")
-                [[
-                    "analyte",
-                    "per_analyte_recommended_method",
-                    "residual_shapiro_p",
-                    "residual_normality_pass_0_05",
-                    "normalization_score_lower_is_better",
-                    "recommendation_reason",
-                ]]
-            )
-            recommendation = pd.DataFrame([{
-                "recommended_normalization_method_overall": best_method,
-                "final_run_mode": "per-analyte map" if cfg.analyte_normalization_map else "single selected method",
-                "selection_rule": "per-analyte recommendation uses paired longitudinal drift metrics: reference/day CV, device/day CV, paired %bias slope/range, and level-separation preservation. Shapiro-Wilk is reported for inference/outlier checks but does not drive normalization selection.",
-            }])
-            zf.writestr(f"{base_dir}/normalization_recommendation.csv", recommendation.to_csv(index=False).encode("utf-8"))
-            zf.writestr(f"{base_dir}/normalization_recommendation_by_analyte.csv", per_analyte_recommendation.to_csv(index=False).encode("utf-8"))
+    for analyte in analysis_analytes:
+        for level in cfg.levels:
+            for scope_name, scope_df, expected_n_scope in scope_tables:
+                sub = scope_df[scope_df["Level"].astype(str) == str(level)].copy()
+                if sub.empty or analyte not in sub.columns:
+                    continue
+                out, with_outliers, clean, outlier_log = compute_ep05_components(sub, analyte, cfg, expected_n_scope)
+                all_rows.append(out)
+                if outlier_log is not None and not outlier_log.empty:
+                    all_outlier_logs.append(outlier_log)
 
-        scope_tables = []
-        if cfg.device_mode == "Pool all devices":
-            pooled_df = df_f.copy()
-            pooled_df["Device"] = "pooled_all_devices"
-            scope_tables.append(("pooled_all_devices", pooled_df, len(cfg.days) * len(cfg.replicates) * len(cfg.devices)))
-        else:
-            pooled_df = df_f.copy()
-            pooled_df["Device"] = "pooled_all_devices"
-            scope_tables.append(("pooled_all_devices", pooled_df, len(cfg.days) * len(cfg.replicates) * len(cfg.devices)))
-            for device in cfg.devices:
-                scope_tables.append((str(device), df_f[df_f["Device"] == str(device)].copy(), len(cfg.days) * len(cfg.replicates)))
+    summary = pd.DataFrame(all_rows)
+    outlier_log_all = pd.concat(all_outlier_logs, ignore_index=True) if all_outlier_logs else pd.DataFrame()
+    results = _format_results(summary)
+    outliers = _format_outliers(outlier_log_all, _design_filter(eligible_raw, cfg), cfg)
+    global_log = _global_flag_audit(excluded_global, cfg)
 
-        for analyte in analysis_analytes:
-            for level in cfg.levels:
-                for scope_name, scope_df, expected_n_scope in scope_tables:
-                    sub = scope_df[scope_df["Level"] == level].copy()
-                    if sub.empty or analyte not in sub.columns:
-                        continue
+    settings = pd.DataFrame({
+        "setting": [
+            "device_mode", "normalization_method", "value_output_modes", "outlier_method", "max_remove_per_group",
+            "gcrit_mode", "manual_gcrit", "gcrit_alpha", "gcrit_tail", "modified_z_threshold", "robust_interval_z",
+            "bootstrap_95CI", "bootstrap_iterations", "random_seed", "levels", "days", "replicates", "devices",
+            "global_flag_column", "treat_all_global_flag_as_false",
+        ],
+        "value": [
+            cfg.device_mode, cfg.normalization_method, "; ".join(cfg.value_output_modes), cfg.outlier_method, cfg.max_remove_per_group,
+            cfg.gcrit_mode, cfg.gcrit, cfg.gcrit_alpha, cfg.gcrit_tail, cfg.modified_z_threshold, cfg.robust_interval_z,
+            cfg.do_bootstrap_ci, cfg.n_boot, cfg.seed, ", ".join(map(str, cfg.levels)), ", ".join(map(str, cfg.days)),
+            ", ".join(map(str, cfg.replicates)), ", ".join(map(str, cfg.devices)), cfg.global_flag_col or "None", cfg.treat_all_global_false,
+        ],
+    })
 
-                    out, with_outliers, clean, outlier_log = compute_ep05_components(sub, analyte, cfg, expected_n_scope)
-                    all_rows.append(out)
-                    if outlier_log is not None and not outlier_log.empty:
-                        all_outlier_logs.append(outlier_log)
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        results.to_excel(writer, sheet_name="Results", index=False)
+        outliers.to_excel(writer, sheet_name="Outliers", index=False)
+        global_log.to_excel(writer, sheet_name="global flag TRUE", index=False)
+        pair_table.rename(columns={"analyte": "Analyte", "device_column": "Device column", "reference_column": "Reference column"}).to_excel(writer, sheet_name="Analyte mapping", index=False)
+        norm_comparison.to_excel(writer, sheet_name="Normalization comparison", index=False)
+        settings.to_excel(writer, sheet_name="Settings", index=False)
 
-                    stem = f"{safe(analyte)}__{safe(level)}__{safe(scope_name)}"
-
-                    zf.writestr(
-                        f"{base_dir}/{safe(analyte)}/{stem}_data_with_outliers.csv",
-                        with_outliers.to_csv(index=False).encode("utf-8"),
-                    )
-                    zf.writestr(
-                        f"{base_dir}/{safe(analyte)}/{stem}_EP05_precision_table.csv",
-                        pd.DataFrame([out]).to_csv(index=False).encode("utf-8"),
-                    )
-
-                    vals = pd.to_numeric(clean[analyte], errors="coerce").dropna().to_numpy(dtype=float)
-                    if len(vals) > 0:
-                        title = f"{analyte} | {level} | {scope_name} | {out['method']}"
-                        zf.writestr(f"{base_dir}/{safe(analyte)}/{stem}_histogram.png", make_histogram_png(vals, title))
-                        zf.writestr(f"{base_dir}/{safe(analyte)}/{stem}_boxplot.png", make_boxplot_png(vals, title))
-
-        summary = pd.DataFrame(all_rows)
-        zf.writestr(f"{base_dir}/ALL_analytes_precision_summary.csv", summary.to_csv(index=False).encode("utf-8"))
-
-        outlier_log_all = pd.concat(all_outlier_logs, ignore_index=True) if all_outlier_logs else pd.DataFrame(
-            columns=["analyte", "Level", "Device", "batch_id", "Blood Sample ID", "Day", "Replicate", "removed_order",
-                     "outlier_method_requested", "outlier_method_used", "value_removed", "direction", "outlier_metric",
-                     "outlier_threshold", "details", "gcrit_mode", "gcrit_alpha", "gcrit_tail"]
-        )
-        zf.writestr(f"{base_dir}/ALL_outlier_log.csv", outlier_log_all.to_csv(index=False).encode("utf-8"))
-
-        if not summary.empty:
-            pooled = (
-                summary.groupby(["analyte", "Level"], as_index=False)
-                .agg(
-                    mean=("mean", "mean"),
-                    median=("median", "mean"),
-                    center_95CI_low=("center_95CI_low", "mean"),
-                    center_95CI_high=("center_95CI_high", "mean"),
-                    SD_repeat=("SD_repeat", "mean"),
-                    SD_between_day=("SD_between_day", "mean"),
-                    SD_total=("SD_total", "mean"),
-                    CV_repeat_pct=("CV_repeat_%", "mean"),
-                    CV_between_day_pct=("CV_between_day_%", "mean"),
-                    CV_total_pct=("CV_total_%", "mean"),
-                    N_groups=("Device", "nunique"),
-                    parametric_groups=("statistical_branch", lambda x: int(np.sum(pd.Series(x).astype(str).eq("parametric")))),
-                )
-            )
-        else:
-            pooled = pd.DataFrame()
-
-        zf.writestr(f"{base_dir}/ALL_analytes_precision_pooled_by_analyte_level.csv", pooled.to_csv(index=False).encode("utf-8"))
-
-    return zip_buf.getvalue()
+        from openpyxl.styles import Font, PatternFill, Alignment
+        fill = PatternFill("solid", fgColor="D9EAD3")
+        for ws in writer.book.worksheets:
+            ws.freeze_panes = "A2"
+            if ws.max_row and ws.max_column:
+                ws.auto_filter.ref = ws.dimensions
+            for cell in ws[1]:
+                cell.font = Font(bold=True); cell.fill = fill; cell.alignment = Alignment(vertical="center", wrap_text=True)
+            for cells in ws.columns:
+                letter = cells[0].column_letter
+                width = max((len(str(c.value)) if c.value is not None else 0 for c in cells[:min(ws.max_row, 200)]), default=8) + 2
+                ws.column_dimensions[letter].width = min(max(width, 10), 42)
+    return buf.getvalue()
 
 
 # -----------------------------
@@ -1178,7 +1047,7 @@ st.markdown(
 3) Select paired CBC analytes and compare normalization methods  
 4) Choose the recommended method or manually select another  
 5) Choose pooled/per-device handling and outlier settings  
-6) Run → download results ZIP
+6) Run → download one Excel workbook
 """
 )
 
@@ -1234,70 +1103,70 @@ with c3:
 with c4:
     devices = st.multiselect("Devices", options=devices_all, default=devices_default)
 
+flag_options = ["None"] + list(df.columns)
+global_guess = next((c for c in df.columns if c.lower() == "global_flag"), None)
+g1, g2 = st.columns([2, 3])
+with g1:
+    global_flag_col = st.selectbox(
+        "Global flag column", flag_options,
+        index=flag_options.index(global_guess) if global_guess in flag_options else 0,
+    )
+with g2:
+    treat_all_global_false = st.checkbox(
+        "Treat all rows as global_flag = FALSE when no flag column is selected", value=False
+    )
+
+if global_flag_col != "None" and not treat_all_global_false:
+    _ui_flag_mask = df[global_flag_col].map(normalize_bool).fillna(False).astype(bool)
+    df_eligible_ui = df.loc[~_ui_flag_mask].copy()
+else:
+    df_eligible_ui = df.copy()
+
 st.subheader("Paired analytes and normalization")
-available_pairs = resolve_analyte_pairs(df)
-missing_pairs = [a for a in DEFAULT_ANALYTES if a not in available_pairs]
-if missing_pairs:
-    st.warning(f"Some default paired analytes were not found and are hidden: {missing_pairs}")
-
-paired_analytes = st.multiselect(
-    "Select paired analytes to analyze",
-    options=list(available_pairs.keys()),
-    default=list(available_pairs.keys()),
+mapping_seed = default_analyte_mapping_table(df_eligible_ui)
+st.caption("Edit this table to add or remove analyzer models. Multiple models may share the same reference column (for example PLT, PLT 2 and PLT 3 can all use PLT_ref).")
+device_measure_options = [c for c in df_eligible_ui.columns if pd.to_numeric(df_eligible_ui[c], errors="coerce").notna().sum() >= 3]
+reference_options = [c for c in df_eligible_ui.columns if c.lower().endswith("_ref")]
+mapping_table = st.data_editor(
+    mapping_seed,
+    num_rows="dynamic",
+    use_container_width=True,
+    hide_index=True,
+    column_config={
+        "Include": st.column_config.CheckboxColumn("Include", default=True),
+        "Analyte": st.column_config.TextColumn("Analyte", required=True),
+        "Device column": st.column_config.SelectboxColumn("Device column", options=device_measure_options, required=True),
+        "Reference column": st.column_config.SelectboxColumn("Reference column", options=reference_options, required=True),
+    },
+    key="analyte_mapping_editor",
 )
-selected_pair_map = resolve_analyte_pairs(df, paired_analytes)
-
+selected_pair_map = parse_analyte_mapping_table(mapping_table, df_eligible_ui)
+paired_analytes = list(selected_pair_map.keys())
 if selected_pair_map:
-    st.caption("Detected device/reference column mapping")
     st.dataframe(pd.DataFrame([{"Analyte": k, "Device column": v[0], "Reference column": v[1]} for k, v in selected_pair_map.items()]), use_container_width=True)
+else:
+    st.warning("Select or add at least one valid analyte mapping, or choose a raw analyte below.")
+
 
 compare_now = st.checkbox("Show normalization comparison and recommendation", value=True)
 recommended_method = "Raw/no normalization"
 norm_comparison = pd.DataFrame()
-per_analyte_recommended_map: Dict[str, str] = {}
 if compare_now and selected_pair_map:
-    with st.spinner("Comparing normalization methods and testing paired %bias residual normality..."):
-        norm_comparison = evaluate_normalization_methods(df[df["Level"].astype(str).isin(levels)] if levels else df, selected_pair_map, NORMALIZATION_METHODS)
+    with st.spinner("Comparing normalization methods..."):
+        norm_comparison = evaluate_normalization_methods(df_eligible_ui[df_eligible_ui["Level"].astype(str).isin(levels)] if levels else df_eligible_ui, selected_pair_map, NORMALIZATION_METHODS)
     if not norm_comparison.empty:
         recommended_method = str(norm_comparison.sort_values("overall_score_lower_is_better").iloc[0]["normalization_method"])
-        per_analyte_recs = (
-            norm_comparison.loc[norm_comparison["normality_guided_recommended_for_analyte"].fillna(False)]
-            .sort_values("analyte")
-            [[
-                "analyte",
-                "per_analyte_recommended_method",
-                "residual_shapiro_p",
-                "residual_normality_pass_0_05",
-                "normalization_score_lower_is_better",
-                "recommendation_reason",
-            ]]
-        )
-        per_analyte_recommended_map = dict(zip(per_analyte_recs["analyte"], per_analyte_recs["per_analyte_recommended_method"]))
-        st.success(f"Overall recommended normalization: {recommended_method}")
-        st.caption("Per-analyte recommendation uses paired 5-day drift metrics: reference/day CV, device/day CV, paired %bias slope/range, and level-separation preservation. Shapiro-Wilk is reported for inference/outlier sensitivity, not used as the main normalization selector.")
-        st.dataframe(per_analyte_recs, use_container_width=True)
-        with st.expander("Show full normalization comparison table"):
-            st.dataframe(norm_comparison, use_container_width=True)
+        st.success(f"Recommended normalization for this dataset: {recommended_method}")
+        st.dataframe(norm_comparison, use_container_width=True)
     else:
         st.info("Normalization comparison could not be computed; using raw/no normalization by default.")
 
-use_per_analyte_normalization = False
-if per_analyte_recommended_map:
-    use_per_analyte_normalization = st.checkbox(
-        "Use paired-drift recommended normalization separately for each paired analyte in final run",
-        value=True,
-    )
-
 norm_default_index = NORMALIZATION_METHODS.index(recommended_method) if recommended_method in NORMALIZATION_METHODS else 0
 normalization_method = st.selectbox(
-    "Fallback/single normalization method for the final EP05 run",
+    "Normalization method to use for the final EP05 run",
     NORMALIZATION_METHODS,
     index=norm_default_index,
 )
-
-active_analyte_normalization_map = per_analyte_recommended_map if use_per_analyte_normalization else {}
-if active_analyte_normalization_map:
-    st.info("Final run will use the per-analyte recommended normalization map. The fallback/single method applies only to raw extra analytes or analytes without a recommendation.")
 
 value_output_modes = st.multiselect(
     "Metrics to calculate/analyze from each device-reference pair",
@@ -1306,7 +1175,7 @@ value_output_modes = st.multiselect(
 )
 
 st.subheader("Additional raw analyte columns, optional")
-observed_candidate_cols = [c for c in df.columns if c not in REQUIRED_BASE_COLS]
+observed_candidate_cols = [c for c in df_eligible_ui.columns if c not in REQUIRED_BASE_COLS]
 extra_analytes = st.multiselect(
     "Optional: also analyze raw columns directly without paired normalization",
     options=sorted(observed_candidate_cols),
@@ -1318,7 +1187,7 @@ c1, c2, c3, c4 = st.columns(4)
 with c1:
     device_mode = st.selectbox("Device handling", ["Pool all devices", "Analyze each device separately + pooled"])
 with c2:
-    do_bootstrap_ci = st.checkbox("Bootstrap 95% CIs", value=True)
+    do_bootstrap_ci = st.checkbox("Bootstrap 95% CIs", value=False)
 with c3:
     n_boot = st.number_input("Bootstrap iterations", min_value=200, max_value=20000, value=2000, step=200)
 with c4:
@@ -1390,10 +1259,9 @@ placeholder_cfg = Config(
     normalization_method=normalization_method,
     value_output_modes=value_output_modes,
     analyte_pair_map=selected_pair_map,
-    analyte_normalization_map=active_analyte_normalization_map,
 )
 try:
-    df_check, analysis_analytes_check, _ = build_analysis_dataframe(df, placeholder_cfg)
+    df_check, analysis_analytes_check, _ = build_analysis_dataframe(df_eligible_ui, placeholder_cfg)
     ok, msg = validate_and_standardize(df_check, analysis_analytes_check)
 except Exception as e:
     ok, msg = False, str(e)
@@ -1437,16 +1305,21 @@ if run_btn:
         normalization_method=normalization_method,
         value_output_modes=value_output_modes,
         analyte_pair_map=selected_pair_map,
-        analyte_normalization_map=active_analyte_normalization_map,
+        global_flag_col=None if global_flag_col == "None" else global_flag_col,
+        treat_all_global_false=bool(treat_all_global_false),
     )
 
-    with st.spinner("Running analysis..."):
-        zip_bytes = run_pipeline_to_zip(df, cfg)
+    if (not cfg.treat_all_global_false) and (not cfg.global_flag_col):
+        st.error("Select a Global flag column, or tick the option to treat all rows as global_flag = FALSE.")
+        st.stop()
 
-    st.success("Done. Download your results ZIP below.")
+    with st.spinner("Running analysis, excluding global_flag=TRUE rows, and creating the combined workbook..."):
+        excel_bytes = run_pipeline_to_excel(df, cfg)
+
+    st.success("Done. All results and audit tables are in one Excel workbook.")
     st.download_button(
-        label="Download results ZIP",
-        data=zip_bytes,
-        file_name="ep05_precision_results_normalization_updated.zip",
-        mime="application/zip",
+        label="Download combined Excel results",
+        data=excel_bytes,
+        file_name="imprecision_long_results.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
