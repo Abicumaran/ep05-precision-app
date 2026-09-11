@@ -37,6 +37,13 @@ DEFAULT_ANALYTE_PAIRS = {
 }
 
 DEFAULT_ANALYTES = list(DEFAULT_ANALYTE_PAIRS.keys())
+
+# Keep analyte/model choices in the same user-facing order as the Short-Term app.
+# These are uploaded device-result column names, not a change to the EP05 method.
+DEFAULT_ANALYTE_COLUMN_ORDER = [
+    "RBC", "WBC_2", "PLT", "HCT", "HGB", "MCV", "RDW", "MCH", "MCHC",
+    "NEUT_2", "LYMPH_2", "MXD_2", "PLT_3", "MCV_3", "RDW_3",
+]
 DEFAULT_LEVELS = ["Low", "Mid", "High"]
 DEFAULT_DAYS = ["D1", "D2", "D3", "D4", "D5"]
 DEFAULT_REPLICATES = [1, 2, 3, 4, 5]
@@ -157,13 +164,22 @@ def default_analyte_mapping_table(df: pd.DataFrame) -> pd.DataFrame:
     for label, (dev_col, ref_col) in base_pairs.items():
         rows.append({"Include": True, "Analyte": label, "Device column": dev_col, "Reference column": ref_col})
 
-    # Requested additional platelet models share the same PLT reference column.
-    if "PLT_ref" in df.columns:
-        for suffix in ("2", "3"):
-            dev_col = f"PLT_{suffix}"
-            label = f"PLT {suffix}"
-            if dev_col in df.columns and not any(r["Device column"] == dev_col for r in rows):
-                rows.append({"Include": True, "Analyte": label, "Device column": dev_col, "Reference column": "PLT_ref"})
+    # Additional model columns can share the same validated reference analyte.
+    # This only expands user-selectable mappings; it does not alter the EP05 calculations.
+    extra_models = [
+        ("PLT_2", "PLT 2", "PLT_ref"),
+        ("PLT_3", "PLT 3", "PLT_ref"),
+        ("MCV_3", "MCV 3", "MCV_ref"),
+        ("RDW_3", "RDW 3", "RDW_ref"),
+    ]
+    for dev_col, label, ref_col in extra_models:
+        if dev_col in df.columns and ref_col in df.columns and not any(r["Device column"] == dev_col for r in rows):
+            rows.append({"Include": True, "Analyte": label, "Device column": dev_col, "Reference column": ref_col})
+
+    # Reorder starter rows to mirror the Short-Term analyte selector, then append
+    # any additional mappings that are not part of that preferred list.
+    order_index = {name: i for i, name in enumerate(DEFAULT_ANALYTE_COLUMN_ORDER)}
+    rows.sort(key=lambda r: (order_index.get(str(r["Device column"]), len(order_index)), str(r["Device column"])))
     return pd.DataFrame(rows, columns=["Include", "Analyte", "Device column", "Reference column"])
 
 
@@ -1123,7 +1139,28 @@ else:
     df_eligible_ui = df.copy()
 
 st.subheader("Paired analytes and normalization")
-mapping_seed = default_analyte_mapping_table(df_eligible_ui)
+mapping_seed_all = default_analyte_mapping_table(df_eligible_ui)
+
+# Explicit analyte/model selector, matching the Short-Term app behavior.
+# Options and selected tags are shown as uploaded device-result column names.
+if not mapping_seed_all.empty:
+    detected_model_cols = mapping_seed_all["Device column"].astype(str).tolist()
+else:
+    detected_model_cols = []
+preferred_present = [c for c in DEFAULT_ANALYTE_COLUMN_ORDER if c in detected_model_cols]
+ordered_model_options = preferred_present + [c for c in detected_model_cols if c not in preferred_present]
+selected_model_cols = st.multiselect(
+    "Analyte/model columns to analyze",
+    options=ordered_model_options,
+    default=ordered_model_options,
+    help="Choose exactly which analyte/model result columns to include. The suggested order matches the Short-Term app.",
+)
+mapping_seed = mapping_seed_all[mapping_seed_all["Device column"].astype(str).isin(selected_model_cols)].copy()
+if not mapping_seed.empty:
+    selected_order = {name: i for i, name in enumerate(selected_model_cols)}
+    mapping_seed["__order"] = mapping_seed["Device column"].astype(str).map(selected_order)
+    mapping_seed = mapping_seed.sort_values("__order").drop(columns="__order").reset_index(drop=True)
+
 st.caption("Edit this table to add or remove analyzer models. Multiple models may share the same reference column (for example PLT, PLT 2 and PLT 3 can all use PLT_ref).")
 device_measure_options = [c for c in df_eligible_ui.columns if pd.to_numeric(df_eligible_ui[c], errors="coerce").notna().sum() >= 3]
 reference_options = [c for c in df_eligible_ui.columns if c.lower().endswith("_ref")]
