@@ -1,5 +1,7 @@
 # EP05 Long-Term Precision + Reference Drift Normalization — updated
 
+https://ep05precision.streamlit.app/
+
 The existing EP05/normalization/statistical calculations are retained. Changes are automation, mapping, exclusion audit, defaults, and output packaging.
 
 - Global-flag column selector and explicit “treat all as FALSE” override.
