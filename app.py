@@ -124,6 +124,12 @@ def standardize_base_columns(df: pd.DataFrame) -> pd.DataFrame:
                 out[canonical] = out[found]
     if "Device" not in out.columns and "deviceId" in out.columns:
         out["Device"] = out["deviceId"].astype(str)
+    # Normalize day labels so combined files containing d1/D1 variants behave
+    # identically to the corresponding level-specific files.
+    if "Day" in out.columns:
+        out["Day"] = out["Day"].map(lambda x: str(x).strip().upper() if pd.notna(x) else x)
+    if "Level" in out.columns:
+        out["Level"] = out["Level"].map(lambda x: str(x).strip() if pd.notna(x) else x)
     return out
 
 
@@ -1208,6 +1214,66 @@ def _format_outliers(outlier_log: pd.DataFrame, analyzed_source: pd.DataFrame, c
     return pd.DataFrame(rows, columns=cols)
 
 
+def build_per_sample_cv_table(df_f: pd.DataFrame, analysis_analytes: List[str], cfg: Config) -> pd.DataFrame:
+    """Descriptive CV for each Blood Sample ID after global-flag/design filtering.
+
+    In the supplied EP05 files each Blood Sample ID usually identifies one day/replicate
+    observation measured on multiple devices, so the directly estimable sample-level CV is
+    the cross-device CV. If a sample ID spans >=2 days, a robust per-sample CV_total is also
+    reported. These are supplemental and do not replace the level-level EP05 Results table.
+    """
+    if df_f is None or df_f.empty or "Blood Sample ID" not in df_f.columns:
+        return pd.DataFrame()
+    rows = []
+    for level in sorted(df_f["Level"].dropna().astype(str).unique()):
+        ldf = df_f[df_f["Level"].astype(str) == str(level)].copy()
+        for analyte in analysis_analytes:
+            if analyte not in ldf.columns:
+                continue
+            for sample_id, sdf in ldf.groupby("Blood Sample ID", dropna=False):
+                vals = pd.to_numeric(sdf[analyte], errors="coerce").dropna().to_numpy(dtype=float)
+                if len(vals) == 0:
+                    continue
+                mean_v = float(np.mean(vals))
+                median_v = float(np.median(vals))
+                sd_v = float(np.std(vals, ddof=1)) if len(vals) >= 2 else np.nan
+                cv_v = 100.0 * sd_v / abs(mean_v) if np.isfinite(sd_v) and mean_v != 0 else np.nan
+                rsd = robust_sd_mad(vals) if len(vals) >= 2 else np.nan
+                rcv = 100.0 * rsd / abs(median_v) if np.isfinite(rsd) and median_v != 0 else np.nan
+                n_days = int(sdf["Day"].astype(str).nunique()) if "Day" in sdf.columns else 0
+                per_sample_total = np.nan
+                if n_days >= 2:
+                    try:
+                        comps = robust_precision_components(sdf, analyte, sorted(sdf["Day"].astype(str).unique().tolist()))
+                        per_sample_total = comps[6]
+                    except Exception:
+                        per_sample_total = np.nan
+                rows.append({
+                    "Level": str(level),
+                    "Blood Sample ID": str(sample_id),
+                    "Analyte": str(analyte).split("__", 1)[0],
+                    "analysis_column": analyte,
+                    "N_rows": int(len(vals)),
+                    "N_devices": int(sdf.loc[pd.to_numeric(sdf[analyte], errors="coerce").notna(), "Device"].astype(str).nunique()),
+                    "N_days": n_days,
+                    "mean": mean_v,
+                    "median": median_v,
+                    "SD_across_devices": sd_v,
+                    "CV_across_devices_%": cv_v,
+                    "robust_CV_across_devices_%": rcv,
+                    "CV_total_%_if_sample_spans_multiple_days": per_sample_total,
+                    "analysis_stage": "after global-flag/design filtering; before statistical outlier removal",
+                })
+    return pd.DataFrame(rows)
+
+
+def build_long_counts_audit(results: pd.DataFrame) -> pd.DataFrame:
+    if results is None or results.empty:
+        return pd.DataFrame(columns=["Level", "Analyte", "Device", "N_raw", "N_clean", "n_outliers", "expected_n"])
+    cols = [c for c in ["Level", "Analyte", "Device", "N_raw", "N_clean", "n_outliers", "expected_n"] if c in results.columns]
+    return results[cols].copy()
+
+
 def run_pipeline_to_excel(df: pd.DataFrame, cfg: Config) -> bytes:
     """Run the existing EP05 pipeline and return one audit-ready Excel workbook."""
     eligible_raw, excluded_global = split_global_flag_rows(df, cfg)
@@ -1221,21 +1287,31 @@ def run_pipeline_to_excel(df: pd.DataFrame, cfg: Config) -> bytes:
 
     all_rows = []
     all_outlier_logs = []
-    scope_tables = []
-    if cfg.device_mode == "Pool all devices":
-        pooled_df = df_f.copy(); pooled_df["Device"] = "pooled_all_devices"
-        scope_tables.append(("pooled_all_devices", pooled_df, len(cfg.days) * len(cfg.replicates) * len(cfg.devices)))
-    else:
-        pooled_df = df_f.copy(); pooled_df["Device"] = "pooled_all_devices"
-        scope_tables.append(("pooled_all_devices", pooled_df, len(cfg.days) * len(cfg.replicates) * len(cfg.devices)))
-        for device in cfg.devices:
-            scope_tables.append((str(device), df_f[df_f["Device"].astype(str) == str(device)].copy(), len(cfg.days) * len(cfg.replicates)))
 
+    # Build scopes within each level. This is critical for combined Low/Mid/High
+    # files where levels can use different device sets or day-label casing. It
+    # makes filtering one level from a combined file mathematically identical to
+    # uploading that level's standalone file.
     for analyte in analysis_analytes:
         for level in cfg.levels:
-            for scope_name, scope_df, expected_n_scope in scope_tables:
-                sub = scope_df[scope_df["Level"].astype(str) == str(level)].copy()
-                if sub.empty or analyte not in sub.columns:
+            level_df = df_f[df_f["Level"].astype(str) == str(level)].copy()
+            if level_df.empty or analyte not in level_df.columns:
+                continue
+            level_days = sorted(level_df["Day"].dropna().astype(str).unique().tolist())
+            level_reps = sorted(pd.to_numeric(level_df["Replicate"], errors="coerce").dropna().astype(int).unique().tolist())
+            level_devices = sorted(level_df["Device"].dropna().astype(str).unique().tolist())
+
+            scope_tables = []
+            pooled_df = level_df.copy(); pooled_df["Device"] = "pooled_all_devices"
+            pooled_expected = len(level_days) * len(level_reps) * len(level_devices)
+            scope_tables.append(("pooled_all_devices", pooled_df, pooled_expected))
+            if cfg.device_mode != "Pool all devices":
+                per_device_expected = len(level_days) * len(level_reps)
+                for device in level_devices:
+                    scope_tables.append((str(device), level_df[level_df["Device"].astype(str) == str(device)].copy(), per_device_expected))
+
+            for scope_name, sub, expected_n_scope in scope_tables:
+                if sub.empty:
                     continue
                 out, with_outliers, clean, outlier_log = compute_ep05_components(sub, analyte, cfg, expected_n_scope)
                 all_rows.append(out)
@@ -1247,6 +1323,8 @@ def run_pipeline_to_excel(df: pd.DataFrame, cfg: Config) -> bytes:
     results = _format_results(summary)
     outliers = _format_outliers(outlier_log_all, _design_filter(eligible_raw, cfg), cfg)
     global_log = _global_flag_audit(excluded_global, cfg)
+    per_sample = build_per_sample_cv_table(df_f, analysis_analytes, cfg)
+    counts_audit = build_long_counts_audit(results)
 
     settings = pd.DataFrame({
         "setting": [
@@ -1266,6 +1344,8 @@ def run_pipeline_to_excel(df: pd.DataFrame, cfg: Config) -> bytes:
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         results.to_excel(writer, sheet_name="Results", index=False, header=LONG_RESULTS_HEADERS)
+        per_sample.to_excel(writer, sheet_name="Per-Sample CV", index=False)
+        counts_audit.to_excel(writer, sheet_name="Row Cell Counts", index=False)
         outliers.to_excel(writer, sheet_name="Outliers", index=False)
         global_log.to_excel(writer, sheet_name="global flag TRUE", index=False)
 
@@ -1318,9 +1398,10 @@ st.subheader("Preview")
 st.dataframe(df.head(20), use_container_width=True)
 
 
-def present_values(col: str, defaults: List[str]) -> Tuple[List[str], List[str]]:
-    if col in df.columns:
-        vals = sorted(list({str(x) for x in df[col].dropna().tolist()}))
+def present_values(col: str, defaults: List[str], source_df: Optional[pd.DataFrame] = None) -> Tuple[List[str], List[str]]:
+    src = df if source_df is None else source_df
+    if col in src.columns:
+        vals = sorted(list({str(x) for x in src[col].dropna().tolist()}))
         if len(defaults) == 0:
             return vals, vals
         if all(str(d) in vals for d in defaults):
@@ -1329,29 +1410,31 @@ def present_values(col: str, defaults: List[str]) -> Tuple[List[str], List[str]]
     return [str(d) for d in defaults], [str(d) for d in defaults]
 
 
-def present_int_values(col: str, defaults: List[int]) -> Tuple[List[int], List[int]]:
-    if col in df.columns:
-        vals = sorted(list({int(x) for x in df[col].dropna().tolist()}))
+def present_int_values(col: str, defaults: List[int], source_df: Optional[pd.DataFrame] = None) -> Tuple[List[int], List[int]]:
+    src = df if source_df is None else source_df
+    if col in src.columns:
+        vals = sorted(list({int(x) for x in src[col].dropna().tolist()}))
         if all(int(d) in vals for d in defaults):
             return defaults, vals
         return vals, vals
     return defaults, defaults
 
 
-levels_default, levels_all = present_values("Level", DEFAULT_LEVELS)
-days_default, days_all = present_values("Day", DEFAULT_DAYS)
-devices_default, devices_all = present_values("Device", DEFAULT_DEVICES)
-rep_default, rep_all = present_int_values("Replicate", DEFAULT_REPLICATES)
+levels_default, levels_all = present_values("Level", DEFAULT_LEVELS, df)
 
 st.subheader("Design selection")
-c1, c2, c3, c4 = st.columns(4)
+st.caption("Selections cascade by Level. If you choose Low from a combined Low/Mid/High workbook, Day/Replicate/Device options are taken from Low only, matching a standalone Low workbook.")
+levels = st.multiselect("Levels", options=levels_all, default=levels_default)
+_design_source = df[df["Level"].astype(str).isin([str(x) for x in levels])].copy() if (levels and "Level" in df.columns) else df.copy()
+days_default, days_all = present_values("Day", DEFAULT_DAYS, _design_source)
+devices_default, devices_all = present_values("Device", DEFAULT_DEVICES, _design_source)
+rep_default, rep_all = present_int_values("Replicate", DEFAULT_REPLICATES, _design_source)
+c1, c2, c3 = st.columns(3)
 with c1:
-    levels = st.multiselect("Levels", options=levels_all, default=levels_default)
-with c2:
     days = st.multiselect("Days", options=days_all, default=days_default)
-with c3:
+with c2:
     replicates = st.multiselect("Replicates", options=rep_all, default=rep_default)
-with c4:
+with c3:
     devices = st.multiselect("Devices", options=devices_all, default=devices_default)
 
 flag_options = ["None"] + list(df.columns)
@@ -1372,6 +1455,16 @@ if global_flag_col != "None" and not treat_all_global_false:
     df_eligible_ui = df.loc[~_ui_flag_mask].copy()
 else:
     df_eligible_ui = df.copy()
+# Keep normalization/model selection scoped to the exact selected design.
+if levels:
+    df_eligible_ui = df_eligible_ui[df_eligible_ui["Level"].astype(str).isin([str(x) for x in levels])].copy()
+if days:
+    df_eligible_ui = df_eligible_ui[df_eligible_ui["Day"].astype(str).isin([str(x) for x in days])].copy()
+if devices:
+    df_eligible_ui = df_eligible_ui[df_eligible_ui["Device"].astype(str).isin([str(x) for x in devices])].copy()
+if replicates:
+    _ui_reps = pd.to_numeric(df_eligible_ui["Replicate"], errors="coerce")
+    df_eligible_ui = df_eligible_ui[_ui_reps.isin([int(x) for x in replicates])].copy()
 
 st.subheader("Paired analytes and normalization")
 mapping_seed_all = default_analyte_mapping_table(df_eligible_ui)
@@ -1507,8 +1600,8 @@ with c3:
 expected_n_single_device = len(days) * len(replicates)
 expected_n_pooled = len(days) * len(replicates) * len(devices)
 st.caption(
-    f"Expected N per single device group = Days × Replicates = {len(days)} × {len(replicates)} = **{expected_n_single_device}**. "
-    f"Pooled expected N across selected devices = {len(days)} × {len(replicates)} × {len(devices)} = **{expected_n_pooled}**."
+    f"UI design target: single-device N = {len(days)} × {len(replicates)} = **{expected_n_single_device}**; pooled N = {len(days)} × {len(replicates)} × {len(devices)} = **{expected_n_pooled}**. "
+    "For combined files the calculation uses the actual selected Day × Replicate × Device design within each Level, preventing unrelated levels from inflating expected N."
 )
 st.markdown("""
 **Assumption-aware testing:** each analyte/level/scope now receives Shapiro-Wilk normality testing and Levene variance testing.  
@@ -1600,6 +1693,19 @@ if run_btn:
         excel_bytes = run_pipeline_to_excel(df, cfg)
 
     st.success("Done. All results and audit tables are in one Excel workbook.")
+    try:
+        _preview_results = pd.read_excel(io.BytesIO(excel_bytes), sheet_name="Results", engine="openpyxl")
+        _preview_counts = pd.read_excel(io.BytesIO(excel_bytes), sheet_name="Row Cell Counts", engine="openpyxl")
+        _preview_samples = pd.read_excel(io.BytesIO(excel_bytes), sheet_name="Per-Sample CV", engine="openpyxl")
+        st.markdown("### Reproducibility precision by level")
+        st.dataframe(_preview_results, use_container_width=True, hide_index=True)
+        st.markdown("### Row counts before/after statistical outlier removal")
+        st.dataframe(_preview_counts, use_container_width=True, hide_index=True)
+        st.markdown("### Per-sample CV")
+        st.caption("For current EP05 files, each Blood Sample ID usually spans one day/replicate and multiple devices; therefore CV across devices is shown. A per-sample CV_total is reported only when the same sample ID spans multiple days.")
+        st.dataframe(_preview_samples, use_container_width=True, hide_index=True)
+    except Exception:
+        pass
     st.download_button(
         label="Download combined Excel results",
         data=excel_bytes,
