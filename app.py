@@ -1,4 +1,5 @@
 import io
+import warnings
 import zipfile
 from dataclasses import dataclass, field
 from typing import List, Tuple, Dict, Optional
@@ -8,6 +9,77 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from scipy import stats
 import streamlit as st
+
+# Bundled input helpers: no companion Python file is required.
+# Input and ordering rules shared by the four validated app packages.
+from pathlib import Path
+import hashlib
+import io
+import re
+import numpy as np
+import pandas as pd
+
+ANALYTE_ORDER = ['RBC', 'WBC_2', 'PLT_3', 'HCT', 'HGB', 'MCV_3', 'RDW_3',
+                 'MCH', 'MCHC', 'NEUT_2', 'LYMPH_2', 'MXD_2']
+FALLBACKS = {'WBC_2': ['WBC'], 'PLT_3': ['PLT'], 'MCV_3': ['MCV'],
+             'RDW_3': ['RDW'], 'NEUT_2': ['NEU_2', 'NEUT', 'NEU'],
+             'LYMPH_2': ['LYMPH'], 'MXD_2': ['MXD']}
+
+def default_analytes(columns):
+    columns = set(columns)
+    return [next(c for c in [a] + FALLBACKS.get(a, []) if c in columns)
+            for a in ANALYTE_ORDER if any(c in columns for c in [a] + FALLBACKS.get(a, []))]
+
+def identifier(value):
+    if pd.isna(value):
+        return None
+    if isinstance(value, (int, np.integer)):
+        return str(value)
+    if isinstance(value, (float, np.floating)) and np.isfinite(value) and value.is_integer():
+        return str(int(value))
+    return str(value).strip()
+
+def canonical_rows(df):
+    """Unique positional index and deterministic rows; never silently deduplicate."""
+    out = df.copy()
+    out.columns = [str(c).strip() for c in out.columns]
+    if out.columns.duplicated().any():
+        raise ValueError('Duplicate column names after trimming spaces.')
+    keys = [c for c in ['Condition', 'Interferent', 'Level', 'bloodSampleId',
+                        'Blood Sample ID', 'sample_id', 'donor', 'specimen_type',
+                        'Day', 'Device', 'deviceId', 'Replicate', 'batch_id'] if c in out]
+    for c in keys:
+        if c not in ['Replicate']:
+            out[c] = out[c].map(identifier)
+    if keys:
+        # A string sort keeps IDs stable across mixed Excel and CSV dtypes.
+        order = out[keys].fillna('').astype(str).sort_values(keys, kind='stable').index
+        # Duplicate source indices are common after concatenating workbooks.
+        tmp = out.reset_index(drop=True)
+        order = tmp[keys].fillna('').astype(str).sort_values(keys, kind='stable').index
+        out = tmp.loc[order]
+    return out.reset_index(drop=True)
+
+def read_input(source):
+    name = str(getattr(source, 'name', source)).lower()
+    if hasattr(source, 'seek'):
+        source.seek(0)
+    if name.endswith('.csv'):
+        df = pd.read_csv(source, float_precision='round_trip')
+    elif name.endswith('.xlsx'):
+        df = pd.read_excel(source, engine='openpyxl')
+    else:
+        raise ValueError('Upload an .xlsx or .csv file; convert legacy .xls to .xlsx first.')
+    return canonical_rows(df)
+
+def stable_rng(seed, *key):
+    digest = hashlib.sha256('|'.join(map(str, key)).encode()).digest()
+    return np.random.default_rng(np.random.SeedSequence([int(seed), int.from_bytes(digest[:8], 'little')]))
+
+def finite_numeric(values):
+    return pd.to_numeric(values, errors='coerce').replace([np.inf, -np.inf], np.nan)
+
+
 import statsmodels.formula.api as smf
 
 # -----------------------------
@@ -15,6 +87,9 @@ import statsmodels.formula.api as smf
 # -----------------------------
 REQUIRED_BASE_COLS = ["batch_id", "Blood Sample ID", "Level", "Day", "Replicate", "Device"]
 BASE_COL_ALIASES = {
+    "Level": ["Level", "Condition", "level", "condition"],
+    "Day": ["Day", "day"],
+    "Replicate": ["Replicate", "replicate"],
     "Blood Sample ID": ["Blood Sample ID", "bloodSampleId", "blood_sample_id", "sample_id"],
     "Device": ["Device", "deviceId", "device_id", "serialNumber", "serial_number"],
 }
@@ -24,11 +99,11 @@ BASE_COL_ALIASES = {
 DEFAULT_ANALYTE_PAIRS = {
     "RBC": ("RBC", "RBC_ref"),
     "WBC": ("WBC_2", "WBC_ref"),
-    "PLT": ("PLT", "PLT_ref"),
+    "PLT": (["PLT_3", "PLT"], "PLT_ref"),
     "HCT": ("HCT", "HCT_ref"),
     "HGB": ("HGB", "HGB_ref"),
-    "MCV": ("MCV", "MCV_ref"),
-    "RDW": ("RDW", "RDW_ref"),
+    "MCV": (["MCV_3", "MCV"], "MCV_ref"),
+    "RDW": (["RDW_3", "RDW"], "RDW_ref"),
     "MCH": ("MCH", "MCH_ref"),
     "MCHC": ("MCHC", "MCHC_ref"),
     "NEU": (["NEU_2", "NEUT_2", "NEU", "NEUT"], ["NEU_ref", "NEUT_ref"]),
@@ -40,10 +115,7 @@ DEFAULT_ANALYTES = list(DEFAULT_ANALYTE_PAIRS.keys())
 
 # Keep analyte/model choices in the same user-facing order as the Short-Term app.
 # These are uploaded device-result column names, not a change to the EP05 method.
-DEFAULT_ANALYTE_COLUMN_ORDER = [
-    "RBC", "WBC_2", "PLT", "HCT", "HGB", "MCV", "RDW", "MCH", "MCHC",
-    "NEUT_2", "LYMPH_2", "MXD_2", "PLT_3", "MCV_3", "RDW_3",
-]
+DEFAULT_ANALYTE_COLUMN_ORDER = ANALYTE_ORDER
 DEFAULT_LEVELS = ["Low", "Mid", "High"]
 DEFAULT_DAYS = ["D1", "D2", "D3", "D4", "D5"]
 DEFAULT_REPLICATES = [1, 2, 3, 4, 5]
@@ -94,7 +166,7 @@ class Config:
     n_boot: int
     seed: int
     paired_analytes: List[str] = field(default_factory=list)
-    normalization_method: str = "Raw/no normalization"
+    normalization_method: str = "Combined paired correction: five-day reference + paired log-ratio"
     value_output_modes: List[str] = field(default_factory=lambda: ["Device normalized value"])
     analyte_pair_map: Dict[str, Tuple[str, str]] = field(default_factory=dict)
     analyte_normalization_map: Dict[str, str] = field(default_factory=dict)
@@ -116,7 +188,7 @@ def first_existing_column(df: pd.DataFrame, candidates) -> Optional[str]:
 
 def standardize_base_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Accept the uploaded dataset aliases without requiring manual column edits."""
-    out = df.copy()
+    out = canonical_rows(df)
     for canonical, aliases in BASE_COL_ALIASES.items():
         if canonical not in out.columns:
             found = first_existing_column(out, aliases)
@@ -129,7 +201,9 @@ def standardize_base_columns(df: pd.DataFrame) -> pd.DataFrame:
     if "Day" in out.columns:
         out["Day"] = out["Day"].map(lambda x: str(x).strip().upper() if pd.notna(x) else x)
     if "Level" in out.columns:
-        out["Level"] = out["Level"].map(lambda x: str(x).strip() if pd.notna(x) else x)
+        out["Level"] = out["Level"].map(lambda x: str(x).strip().title() if pd.notna(x) else x)
+    if "Device" in out:
+        out["Device"] = out["Device"].map(identifier)
     return out
 
 
@@ -184,7 +258,7 @@ def default_analyte_mapping_table(df: pd.DataFrame) -> pd.DataFrame:
     ]
     for dev_col, label, ref_col in extra_models:
         if dev_col in df.columns and ref_col in df.columns and not any(r["Device column"] == dev_col for r in rows):
-            rows.append({"Include": True, "Analyte": label, "Device column": dev_col, "Reference column": ref_col})
+            rows.append({"Include": False, "Analyte": label, "Device column": dev_col, "Reference column": ref_col})
 
     # Reorder starter rows to mirror the Short-Term analyte selector, then append
     # any additional mappings that are not part of that preferred list.
@@ -726,7 +800,7 @@ def select_actual_outlier_method(method: str, vals: np.ndarray) -> str:
 
 def detect_outliers_one_group(df_group: pd.DataFrame, analyte: str, cfg: Config) -> Tuple[pd.DataFrame, pd.DataFrame]:
     work = df_group.copy()
-    work[analyte] = pd.to_numeric(work[analyte], errors="coerce")
+    work[analyte] = finite_numeric(work[analyte])
     work["is_outlier"] = False
     work["outlier_order"] = np.nan
     work["outlier_method"] = ""
@@ -867,8 +941,7 @@ def robust_precision_components(df_clean: pd.DataFrame, analyte: str, days: List
         vals = pd.to_numeric(df_clean.loc[df_clean["Day"].astype(str) == str(d), analyte], errors="coerce").dropna().to_numpy(dtype=float)
         if len(vals) >= 2:
             within_sds.append(robust_sd_mad(vals))
-        elif len(vals) == 1:
-            within_sds.append(0.0)
+
     sd_repeat = float(np.median(within_sds)) if len(within_sds) else np.nan
 
     day_meds = []
@@ -876,7 +949,7 @@ def robust_precision_components(df_clean: pd.DataFrame, analyte: str, days: List
         vals = pd.to_numeric(df_clean.loc[df_clean["Day"].astype(str) == str(d), analyte], errors="coerce").dropna().to_numpy(dtype=float)
         if len(vals) > 0:
             day_meds.append(np.median(vals))
-    sd_day = float(robust_sd_mad(np.array(day_meds))) if len(day_meds) >= 2 else 0.0
+    sd_day = float(robust_sd_mad(np.array(day_meds))) if len(day_meds) >= 2 else np.nan
 
     sd_total = float(np.sqrt(sd_repeat**2 + sd_day**2)) if np.isfinite(sd_repeat) and np.isfinite(sd_day) else np.nan
     center = float(np.median(y)) if len(y) else np.nan
@@ -886,20 +959,46 @@ def robust_precision_components(df_clean: pd.DataFrame, analyte: str, days: List
     return sd_repeat, sd_day, sd_total, center, cv_repeat, cv_day, cv_total
 
 
-def bootstrap_precision_ci(df_clean: pd.DataFrame, analyte: str, days: List[str], n_boot: int, seed: int) -> Dict[str, float]:
+def bootstrap_precision_ci(df_clean: pd.DataFrame, analyte: str, days: List[str], n_boot: int, seed: int, estimator: str = "ROBUST_MAD") -> Dict[str, float]:
+    """Conditional within-day bootstrap using the point estimate's estimator.
+
+    Day sample sizes and the observed five-day design are held fixed. Failed
+    model fits are counted; they are never substituted with another estimator.
+    """
+    if estimator not in {"ROBUST_MAD", "MIXEDLM"}:
+        raise ValueError("Unknown precision estimator")
     rng = np.random.default_rng(int(seed))
     clean = df_clean.copy()
     clean[analyte] = pd.to_numeric(clean[analyte], errors="coerce")
-    clean = clean.dropna(subset=[analyte])
+    clean = clean.replace({analyte: {np.inf: np.nan, -np.inf: np.nan}}).dropna(subset=[analyte]).reset_index(drop=True)
     if len(clean) < 3:
         return {}
 
     cols = ["SD_repeat", "SD_between_day", "SD_total", "CV_repeat_%", "CV_between_day_%", "CV_total_%"]
     vals = {c: [] for c in cols}
+    successful = 0
+    groups = [g for _, g in clean.groupby("Day", sort=True)]
     for _ in range(int(n_boot)):
-        idx = rng.choice(clean.index.to_numpy(), size=len(clean), replace=True)
-        boot = clean.loc[idx].copy()
-        comps = robust_precision_components(boot, analyte, days)
+        boot = pd.concat([g.iloc[rng.integers(0, len(g), len(g))] for g in groups], ignore_index=True)
+        if estimator == "MIXEDLM":
+            try:
+                model = smf.mixedlm("value ~ 1", boot.rename(columns={analyte: "value"}), groups=boot["Day"])
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    fit = model.fit(reml=True, method="lbfgs", disp=False)
+                if not fit.converged:
+                    continue
+                within = np.sqrt(max(float(fit.scale), 0.0))
+                between = np.sqrt(max(float(fit.cov_re.iloc[0, 0]), 0.0))
+                total = np.hypot(within, between)
+                center = float(boot[analyte].mean())
+                cv = [100.0 * sd / abs(center) if center != 0 else np.nan for sd in [within, between, total]]
+                comps = (within, between, total, center, *cv)
+            except Exception:
+                continue
+        else:
+            comps = robust_precision_components(boot, analyte, days)
+        successful += 1
         row = {
             "SD_repeat": comps[0],
             "SD_between_day": comps[1],
@@ -912,11 +1011,13 @@ def bootstrap_precision_ci(df_clean: pd.DataFrame, analyte: str, days: List[str]
             if np.isfinite(row[c]):
                 vals[c].append(row[c])
 
-    out = {}
+    out = {"bootstrap_estimator": estimator, "bootstrap_design": "within-day resampling; observed days fixed",
+           "bootstrap_requested": int(n_boot), "bootstrap_successful": successful,
+           "bootstrap_failed": int(n_boot) - successful}
     for c in cols:
         arr = np.asarray(vals[c], dtype=float)
         arr = arr[np.isfinite(arr)]
-        if len(arr):
+        if len(arr) >= max(20, int(np.ceil(0.8 * n_boot))):
             lo, hi = np.percentile(arr, [2.5, 97.5])
             out[f"{c}_95CI_low"] = float(lo)
             out[f"{c}_95CI_high"] = float(hi)
@@ -1033,6 +1134,8 @@ def compute_ep05_components(df_group: pd.DataFrame, analyte: str, cfg: Config, e
             df_m = df_clean.rename(columns={analyte: "value"}).copy()
             model = smf.mixedlm("value ~ 1", df_m, groups=df_m["Day"])
             res = model.fit(reml=True, method="lbfgs", disp=False)
+            if not res.converged:
+                raise ValueError("MixedLM did not converge")
 
             var_day = float(res.cov_re.iloc[0, 0]) if res.cov_re.shape == (1, 1) else 0.0
             var_within = float(res.scale)
@@ -1057,7 +1160,7 @@ def compute_ep05_components(df_group: pd.DataFrame, analyte: str, cfg: Config, e
             out["CV_total_%"] = cv_total
 
             if cfg.do_bootstrap_ci:
-                out.update(bootstrap_precision_ci(df_clean, analyte, cfg.days, cfg.n_boot, cfg.seed))
+                out.update(bootstrap_precision_ci(df_clean, analyte, cfg.days, cfg.n_boot, cfg.seed, estimator="MIXEDLM"))
 
             return out, df_with, df_clean, outlier_log
         except Exception:
@@ -1231,7 +1334,7 @@ def build_per_sample_cv_table(df_f: pd.DataFrame, analysis_analytes: List[str], 
             if analyte not in ldf.columns:
                 continue
             for sample_id, sdf in ldf.groupby("Blood Sample ID", dropna=False):
-                vals = pd.to_numeric(sdf[analyte], errors="coerce").dropna().to_numpy(dtype=float)
+                vals = finite_numeric(sdf[analyte]).dropna().to_numpy(dtype=float)
                 if len(vals) == 0:
                     continue
                 mean_v = float(np.mean(vals))
@@ -1242,7 +1345,7 @@ def build_per_sample_cv_table(df_f: pd.DataFrame, analysis_analytes: List[str], 
                 rcv = 100.0 * rsd / abs(median_v) if np.isfinite(rsd) and median_v != 0 else np.nan
                 n_days = int(sdf["Day"].astype(str).nunique()) if "Day" in sdf.columns else 0
                 per_sample_total = np.nan
-                if n_days >= 2:
+                if n_days >= 2 and sdf.groupby("Day")[analyte].count().ge(2).all():
                     try:
                         comps = robust_precision_components(sdf, analyte, sorted(sdf["Day"].astype(str).unique().tolist()))
                         per_sample_total = comps[6]
@@ -1262,7 +1365,7 @@ def build_per_sample_cv_table(df_f: pd.DataFrame, analysis_analytes: List[str], 
                     "CV_across_devices_%": cv_v,
                     "robust_CV_across_devices_%": rcv,
                     "CV_total_%_if_sample_spans_multiple_days": per_sample_total,
-                    "analysis_stage": "after global-flag/design filtering; before statistical outlier removal",
+                    "analysis_stage": "after global-flag/design filtering; stage indicated in analysis_stage",
                 })
     return pd.DataFrame(rows)
 
@@ -1274,8 +1377,11 @@ def build_long_counts_audit(results: pd.DataFrame) -> pd.DataFrame:
     return results[cols].copy()
 
 
-def run_pipeline_to_excel(df: pd.DataFrame, cfg: Config) -> bytes:
+def run_analysis(df: pd.DataFrame, cfg: Config):
     """Run the existing EP05 pipeline and return one audit-ready Excel workbook."""
+    df = standardize_base_columns(df)
+    if df[REQUIRED_BASE_COLS].isna().any().any():
+        raise ValueError("Missing sample, batch, level, day, replicate, or device identifier.")
     eligible_raw, excluded_global = split_global_flag_rows(df, cfg)
     df_work, analysis_analytes, pair_table = build_analysis_dataframe(eligible_raw, cfg)
     df_f = _design_filter(df_work, cfg)
@@ -1287,6 +1393,8 @@ def run_pipeline_to_excel(df: pd.DataFrame, cfg: Config) -> bytes:
 
     all_rows = []
     all_outlier_logs = []
+    sample_tables = []
+    normalized_tables = []
 
     # Build scopes within each level. This is critical for combined Low/Mid/High
     # files where levels can use different device sets or day-label casing. It
@@ -1315,6 +1423,18 @@ def run_pipeline_to_excel(df: pd.DataFrame, cfg: Config) -> bytes:
                     continue
                 out, with_outliers, clean, outlier_log = compute_ep05_components(sub, analyte, cfg, expected_n_scope)
                 all_rows.append(out)
+                for stage, subset in [("raw_after_QC", sub), ("cleaned_after_outliers", clean)]:
+                    original = df_f.loc[subset.index].copy()
+                    sample_table = build_per_sample_cv_table(original, [analyte], cfg)
+                    sample_table["scope"] = scope_name
+                    sample_table["analysis_stage"] = stage
+                    sample_tables.append(sample_table)
+                trace = df_f.loc[with_outliers.index, ["batch_id", "Blood Sample ID", "Level", "Day", "Device", "Replicate", analyte]].copy()
+                trace["analysis_column"] = analyte
+                trace["value"] = trace.pop(analyte)
+                trace["scope"] = scope_name
+                trace["is_outlier"] = with_outliers["is_outlier"].to_numpy()
+                normalized_tables.append(trace)
                 if outlier_log is not None and not outlier_log.empty:
                     all_outlier_logs.append(outlier_log)
 
@@ -1323,7 +1443,7 @@ def run_pipeline_to_excel(df: pd.DataFrame, cfg: Config) -> bytes:
     results = _format_results(summary)
     outliers = _format_outliers(outlier_log_all, _design_filter(eligible_raw, cfg), cfg)
     global_log = _global_flag_audit(excluded_global, cfg)
-    per_sample = build_per_sample_cv_table(df_f, analysis_analytes, cfg)
+    per_sample = pd.concat(sample_tables, ignore_index=True) if sample_tables else pd.DataFrame()
     counts_audit = build_long_counts_audit(results)
 
     settings = pd.DataFrame({
@@ -1341,6 +1461,16 @@ def run_pipeline_to_excel(df: pd.DataFrame, cfg: Config) -> bytes:
         ],
     })
 
+    return {"results": results, "summary": summary, "per_sample": per_sample,
+            "counts": counts_audit, "outliers": outliers, "qc": global_log,
+            "settings": settings, "mapping": pair_table, "normalization_context": df_work,
+            "normalized": pd.concat(normalized_tables, ignore_index=True) if normalized_tables else pd.DataFrame()}
+
+
+def run_pipeline_to_excel(df: pd.DataFrame, cfg: Config) -> bytes:
+    tables = run_analysis(df, cfg)
+    results, per_sample, counts_audit = tables["results"], tables["per_sample"], tables["counts"]
+    outliers, global_log = tables["outliers"], tables["qc"]
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         results.to_excel(writer, sheet_name="Results", index=False, header=LONG_RESULTS_HEADERS)
@@ -1348,6 +1478,11 @@ def run_pipeline_to_excel(df: pd.DataFrame, cfg: Config) -> bytes:
         counts_audit.to_excel(writer, sheet_name="Row Cell Counts", index=False)
         outliers.to_excel(writer, sheet_name="Outliers", index=False)
         global_log.to_excel(writer, sheet_name="global flag TRUE", index=False)
+        tables["settings"].to_excel(writer, sheet_name="Settings", index=False)
+        tables["mapping"].to_excel(writer, sheet_name="Analyte Mapping", index=False)
+        tables["normalization_context"].to_excel(writer, sheet_name="Normalization Context", index=False)
+        tables["normalized"].to_excel(writer, sheet_name="Normalized Values", index=False)
+        tables["summary"].to_excel(writer, sheet_name="Full Statistics", index=False)
 
         from openpyxl.styles import Font, PatternFill, Alignment
         fill = PatternFill("solid", fgColor="D9EAD3")
@@ -1367,297 +1502,230 @@ def run_pipeline_to_excel(df: pd.DataFrame, cfg: Config) -> bytes:
 # -----------------------------
 # Streamlit UI
 # -----------------------------
-st.set_page_config(page_title="EP05 Precision App", layout="wide")
-st.title("EP05 Long-Term Precision + Reference Drift Normalization")
+def main():
+    st.set_page_config(page_title="EP05 Precision App", layout="wide")
+    st.title("EP05 Long-Term Precision + Reference Drift Normalization")
 
-st.markdown(
+    st.markdown(
+        """
+    **Steps**
+    1) Upload XLSX or CSV  
+    2) Confirm/adjust Levels, Days, Replicates, Devices  
+    3) Select paired CBC analytes  
+    4) Use the combined reference/ratio correction or select an explicit alternative  
+    5) Choose pooled/per-device handling and outlier settings  
+    6) Run → download one Excel workbook
     """
-**Steps**
-1) Upload the XLSX  
-2) Confirm/adjust Levels, Days, Replicates, Devices  
-3) Select paired CBC analytes and compare normalization methods  
-4) Choose the recommended method or manually select another  
-5) Choose pooled/per-device handling and outlier settings  
-6) Run → download one Excel workbook
-"""
-)
+    )
 
-uploaded = st.file_uploader("Upload the XLSX", type=["xlsx"])
-if uploaded is None:
-    st.info("Upload your EP05-style XLSX to begin.")
-    st.stop()
+    uploaded = st.file_uploader("Upload Excel or CSV", type=["xlsx", "csv"])
+    if uploaded is None:
+        st.info("Upload your EP05-style XLSX to begin.")
+        st.stop()
 
-try:
-    df_raw = pd.read_excel(uploaded, engine="openpyxl")
-    df = standardize_base_columns(df_raw)
-except Exception as e:
-    st.error(f"Could not read Excel file: {e}")
-    st.stop()
+    try:
+        df_raw = read_input(uploaded)
+        df = standardize_base_columns(df_raw)
+    except Exception as e:
+        st.error(f"Could not read Excel file: {e}")
+        st.stop()
 
-st.subheader("Preview")
-st.dataframe(df.head(20), use_container_width=True)
+    st.subheader("Preview")
+    st.dataframe(df.head(20), use_container_width=True)
 
 
-def present_values(col: str, defaults: List[str], source_df: Optional[pd.DataFrame] = None) -> Tuple[List[str], List[str]]:
-    src = df if source_df is None else source_df
-    if col in src.columns:
-        vals = sorted(list({str(x) for x in src[col].dropna().tolist()}))
-        if len(defaults) == 0:
+    def present_values(col: str, defaults: List[str], source_df: Optional[pd.DataFrame] = None) -> Tuple[List[str], List[str]]:
+        src = df if source_df is None else source_df
+        if col in src.columns:
+            vals = sorted(list({str(x) for x in src[col].dropna().tolist()}))
+            if len(defaults) == 0:
+                return vals, vals
+            if all(str(d) in vals for d in defaults):
+                return [str(d) for d in defaults], vals
             return vals, vals
-        if all(str(d) in vals for d in defaults):
-            return [str(d) for d in defaults], vals
-        return vals, vals
-    return [str(d) for d in defaults], [str(d) for d in defaults]
+        return [str(d) for d in defaults], [str(d) for d in defaults]
 
 
-def present_int_values(col: str, defaults: List[int], source_df: Optional[pd.DataFrame] = None) -> Tuple[List[int], List[int]]:
-    src = df if source_df is None else source_df
-    if col in src.columns:
-        vals = sorted(list({int(x) for x in src[col].dropna().tolist()}))
-        if all(int(d) in vals for d in defaults):
-            return defaults, vals
-        return vals, vals
-    return defaults, defaults
+    def present_int_values(col: str, defaults: List[int], source_df: Optional[pd.DataFrame] = None) -> Tuple[List[int], List[int]]:
+        src = df if source_df is None else source_df
+        if col in src.columns:
+            vals = sorted(list({int(x) for x in src[col].dropna().tolist()}))
+            if all(int(d) in vals for d in defaults):
+                return defaults, vals
+            return vals, vals
+        return defaults, defaults
 
 
-levels_default, levels_all = present_values("Level", DEFAULT_LEVELS, df)
+    levels_default, levels_all = present_values("Level", DEFAULT_LEVELS, df)
 
-st.subheader("Design selection")
-st.caption("Selections cascade by Level. If you choose Low from a combined Low/Mid/High workbook, Day/Replicate/Device options are taken from Low only, matching a standalone Low workbook.")
-levels = st.multiselect("Levels", options=levels_all, default=levels_default)
-_design_source = df[df["Level"].astype(str).isin([str(x) for x in levels])].copy() if (levels and "Level" in df.columns) else df.copy()
-days_default, days_all = present_values("Day", DEFAULT_DAYS, _design_source)
-devices_default, devices_all = present_values("Device", DEFAULT_DEVICES, _design_source)
-rep_default, rep_all = present_int_values("Replicate", DEFAULT_REPLICATES, _design_source)
-c1, c2, c3 = st.columns(3)
-with c1:
-    days = st.multiselect("Days", options=days_all, default=days_default)
-with c2:
-    replicates = st.multiselect("Replicates", options=rep_all, default=rep_default)
-with c3:
-    devices = st.multiselect("Devices", options=devices_all, default=devices_default)
+    st.subheader("Design selection")
+    st.caption("Selections cascade by Level. If you choose Low from a combined Low/Mid/High workbook, Day/Replicate/Device options are taken from Low only, matching a standalone Low workbook.")
+    levels = st.multiselect("Levels", options=levels_all, default=levels_default)
+    _design_source = df[df["Level"].astype(str).isin([str(x) for x in levels])].copy() if (levels and "Level" in df.columns) else df.copy()
+    days_default, days_all = present_values("Day", DEFAULT_DAYS, _design_source)
+    devices_default, devices_all = present_values("Device", DEFAULT_DEVICES, _design_source)
+    rep_default, rep_all = present_int_values("Replicate", DEFAULT_REPLICATES, _design_source)
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        days = st.multiselect("Days", options=days_all, default=days_default)
+    with c2:
+        replicates = st.multiselect("Replicates", options=rep_all, default=rep_default)
+    with c3:
+        devices = st.multiselect("Devices", options=devices_all, default=devices_default)
 
-flag_options = ["None"] + list(df.columns)
-global_guess = next((c for c in df.columns if c.lower() == "global_flag"), None)
-g1, g2 = st.columns([2, 3])
-with g1:
-    global_flag_col = st.selectbox(
-        "Global flag column", flag_options,
-        index=flag_options.index(global_guess) if global_guess in flag_options else 0,
-    )
-with g2:
-    treat_all_global_false = st.checkbox(
-        "Treat all rows as global_flag = FALSE when no flag column is selected", value=False
-    )
+    flag_options = ["None"] + list(df.columns)
+    global_guess = next((c for c in df.columns if c.lower() == "global_flag"), None)
+    g1, g2 = st.columns([2, 3])
+    with g1:
+        global_flag_col = st.selectbox(
+            "Global flag column", flag_options,
+            index=flag_options.index(global_guess) if global_guess in flag_options else 0,
+        )
+    with g2:
+        treat_all_global_false = st.checkbox(
+            "Treat all rows as global_flag = FALSE when no flag column is selected", value=False
+        )
 
-if global_flag_col != "None" and not treat_all_global_false:
-    _ui_flag_mask = df[global_flag_col].map(normalize_bool).fillna(False).astype(bool)
-    df_eligible_ui = df.loc[~_ui_flag_mask].copy()
-else:
-    df_eligible_ui = df.copy()
-# Keep normalization/model selection scoped to the exact selected design.
-if levels:
-    df_eligible_ui = df_eligible_ui[df_eligible_ui["Level"].astype(str).isin([str(x) for x in levels])].copy()
-if days:
-    df_eligible_ui = df_eligible_ui[df_eligible_ui["Day"].astype(str).isin([str(x) for x in days])].copy()
-if devices:
-    df_eligible_ui = df_eligible_ui[df_eligible_ui["Device"].astype(str).isin([str(x) for x in devices])].copy()
-if replicates:
-    _ui_reps = pd.to_numeric(df_eligible_ui["Replicate"], errors="coerce")
-    df_eligible_ui = df_eligible_ui[_ui_reps.isin([int(x) for x in replicates])].copy()
-
-st.subheader("Paired analytes and normalization")
-mapping_seed_all = default_analyte_mapping_table(df_eligible_ui)
-
-# Explicit analyte/model selector, matching the Short-Term app behavior.
-# Options and selected tags are shown as uploaded device-result column names.
-if not mapping_seed_all.empty:
-    detected_model_cols = mapping_seed_all["Device column"].astype(str).tolist()
-else:
-    detected_model_cols = []
-preferred_present = [c for c in DEFAULT_ANALYTE_COLUMN_ORDER if c in detected_model_cols]
-ordered_model_options = preferred_present + [c for c in detected_model_cols if c not in preferred_present]
-selected_model_cols = st.multiselect(
-    "Analyte/model columns to analyze",
-    options=ordered_model_options,
-    default=ordered_model_options,
-    help="Choose exactly which analyte/model result columns to include. The suggested order matches the Short-Term app.",
-)
-mapping_seed = mapping_seed_all[mapping_seed_all["Device column"].astype(str).isin(selected_model_cols)].copy()
-if not mapping_seed.empty:
-    selected_order = {name: i for i, name in enumerate(selected_model_cols)}
-    mapping_seed["__order"] = mapping_seed["Device column"].astype(str).map(selected_order)
-    mapping_seed = mapping_seed.sort_values("__order").drop(columns="__order").reset_index(drop=True)
-
-st.caption("Edit this table to add or remove analyzer models. Multiple models may share the same reference column (for example PLT, PLT 2 and PLT 3 can all use PLT_ref).")
-device_measure_options = [c for c in df_eligible_ui.columns if pd.to_numeric(df_eligible_ui[c], errors="coerce").notna().sum() >= 3]
-reference_options = [c for c in df_eligible_ui.columns if c.lower().endswith("_ref")]
-mapping_table = st.data_editor(
-    mapping_seed,
-    num_rows="dynamic",
-    use_container_width=True,
-    hide_index=True,
-    column_config={
-        "Include": st.column_config.CheckboxColumn("Include", default=True),
-        "Analyte": st.column_config.TextColumn("Analyte", required=True),
-        "Device column": st.column_config.SelectboxColumn("Device column", options=device_measure_options, required=True),
-        "Reference column": st.column_config.SelectboxColumn("Reference column", options=reference_options, required=True),
-    },
-    key="analyte_mapping_editor",
-)
-selected_pair_map = parse_analyte_mapping_table(mapping_table, df_eligible_ui)
-paired_analytes = list(selected_pair_map.keys())
-if selected_pair_map:
-    st.dataframe(pd.DataFrame([{"Analyte": k, "Device column": v[0], "Reference column": v[1]} for k, v in selected_pair_map.items()]), use_container_width=True)
-else:
-    st.warning("Select or add at least one valid analyte mapping, or choose a raw analyte below.")
-
-
-# Automatic paired longitudinal normalization selection. The user no longer has to
-# choose among competing normalization outputs: the app evaluates the validated
-# candidates and applies the recommended method separately for each analyte/model.
-recommended_method = "Raw/no normalization"
-norm_comparison = pd.DataFrame()
-per_analyte_recommended_map: Dict[str, str] = {}
-if selected_pair_map:
-    with st.spinner("Automatically selecting the paired longitudinal normalization for each analyte/model..."):
-        norm_input = df_eligible_ui[df_eligible_ui["Level"].astype(str).isin(levels)] if levels else df_eligible_ui
-        norm_comparison = evaluate_normalization_methods(norm_input, selected_pair_map, NORMALIZATION_METHODS)
-    if not norm_comparison.empty:
-        recommended_method = str(norm_comparison.sort_values("overall_score_lower_is_better").iloc[0]["normalization_method"])
-        chosen = norm_comparison.loc[norm_comparison["normality_guided_recommended_for_analyte"].fillna(False)].copy()
-        if not chosen.empty:
-            per_analyte_recommended_map = dict(zip(chosen["analyte"].astype(str), chosen["per_analyte_recommended_method"].astype(str)))
-            display_cols = [c for c in [
-                "analyte", "per_analyte_recommended_method", "residual_shapiro_p",
-                "residual_normality_pass_0_05", "normalization_score_lower_is_better",
-            ] if c in chosen.columns]
-            st.success("Normalization is selected automatically for the final reportable run.")
-            st.dataframe(chosen[display_cols].sort_values("analyte"), use_container_width=True, hide_index=True)
-        else:
-            st.info(f"Automatic normalization fallback: {recommended_method}")
+    if global_flag_col != "None" and not treat_all_global_false:
+        _ui_flag_mask = df[global_flag_col].map(normalize_bool).fillna(False).astype(bool)
+        df_eligible_ui = df.loc[~_ui_flag_mask].copy()
     else:
-        st.info("Normalization comparison could not be computed; raw/no normalization will be used.")
+        df_eligible_ui = df.copy()
+    # Keep normalization/model selection scoped to the exact selected design.
+    if levels:
+        df_eligible_ui = df_eligible_ui[df_eligible_ui["Level"].astype(str).isin([str(x) for x in levels])].copy()
+    if days:
+        df_eligible_ui = df_eligible_ui[df_eligible_ui["Day"].astype(str).isin([str(x) for x in days])].copy()
+    if devices:
+        df_eligible_ui = df_eligible_ui[df_eligible_ui["Device"].astype(str).isin([str(x) for x in devices])].copy()
+    if replicates:
+        _ui_reps = pd.to_numeric(df_eligible_ui["Replicate"], errors="coerce")
+        df_eligible_ui = df_eligible_ui[_ui_reps.isin([int(x) for x in replicates])].copy()
 
-normalization_method = recommended_method
-active_analyte_normalization_map = per_analyte_recommended_map
+    st.subheader("Paired analytes and normalization")
+    mapping_seed_all = default_analyte_mapping_table(df_eligible_ui)
 
-# Final reporting is intentionally single-path, matching the supplied Results workbook.
-# Paired reference/bias calculations are still used internally for normalization assessment,
-# but only the normalized device precision outcome is reported as the final analyte result.
-value_output_modes = ["Device normalized value"]
-st.caption("Final precision output: one normalized device result per selected analyte/model (no competing reference/bias result tables).")
+    # Explicit analyte/model selector, matching the Short-Term app behavior.
+    # Options and selected tags are shown as uploaded device-result column names.
+    if not mapping_seed_all.empty:
+        detected_model_cols = mapping_seed_all["Device column"].astype(str).tolist()
+    else:
+        detected_model_cols = []
+    preferred_present = [c for c in DEFAULT_ANALYTE_COLUMN_ORDER if c in detected_model_cols]
+    ordered_model_options = preferred_present + [c for c in detected_model_cols if c not in preferred_present]
+    selected_model_cols = st.multiselect(
+        "Analyte/model columns to analyze",
+        options=ordered_model_options,
+        default=default_analytes(detected_model_cols),
+        help="Choose exactly which analyte/model result columns to include. The suggested order matches the Short-Term app.",
+    )
+    mapping_seed = mapping_seed_all[mapping_seed_all["Device column"].astype(str).isin(selected_model_cols)].copy()
+    if not mapping_seed.empty:
+        selected_order = {name: i for i, name in enumerate(selected_model_cols)}
+        mapping_seed["__order"] = mapping_seed["Device column"].astype(str).map(selected_order)
+        mapping_seed = mapping_seed.sort_values("__order").drop(columns="__order").reset_index(drop=True)
 
-st.subheader("Additional raw analyte columns, optional")
-observed_candidate_cols = [c for c in df_eligible_ui.columns if c not in REQUIRED_BASE_COLS]
-extra_analytes = st.multiselect(
-    "Optional: also analyze raw columns directly without paired normalization",
-    options=sorted(observed_candidate_cols),
-    default=[],
-)
+    st.caption("Edit this table to add or remove analyzer models. Multiple models may share the same reference column (for example PLT, PLT 2 and PLT 3 can all use PLT_ref).")
+    device_measure_options = [c for c in df_eligible_ui.columns if pd.to_numeric(df_eligible_ui[c], errors="coerce").notna().sum() >= 3]
+    reference_options = [c for c in df_eligible_ui.columns if c.lower().endswith("_ref")]
+    mapping_table = st.data_editor(
+        mapping_seed,
+        num_rows="dynamic",
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Include": st.column_config.CheckboxColumn("Include", default=True),
+            "Analyte": st.column_config.TextColumn("Analyte", required=True),
+            "Device column": st.column_config.SelectboxColumn("Device column", options=device_measure_options, required=True),
+            "Reference column": st.column_config.SelectboxColumn("Reference column", options=reference_options, required=True),
+        },
+        key="analyte_mapping_editor",
+    )
+    selected_pair_map = parse_analyte_mapping_table(mapping_table, df_eligible_ui)
+    paired_analytes = list(selected_pair_map.keys())
+    if selected_pair_map:
+        st.dataframe(pd.DataFrame([{"Analyte": k, "Device column": v[0], "Reference column": v[1]} for k, v in selected_pair_map.items()]), use_container_width=True)
+    else:
+        st.warning("Select or add at least one valid analyte mapping, or choose a raw analyte below.")
 
-st.subheader("Analysis settings")
-c1, c2, c3, c4 = st.columns(4)
-with c1:
-    device_mode = st.selectbox("Device handling", ["Pool all devices", "Analyze each device separately + pooled"])
-with c2:
-    do_bootstrap_ci = st.checkbox("Bootstrap 95% CIs", value=False)
-with c3:
-    n_boot = st.number_input("Bootstrap iterations", min_value=200, max_value=20000, value=2000, step=200)
-with c4:
-    seed = st.number_input("Random seed", min_value=1, max_value=999999, value=123, step=1)
 
-st.subheader("Optional outlier detection")
-outlier_method = st.selectbox(
-    "Outlier method for cleaned/sensitivity results",
-    [
-        "None",
-        "Automatic: Grubbs if Shapiro normal, otherwise Robust MAD",
-        "Gcrit Grubbs-like: remove largest |value-mean|/SD if >= Gcrit",
-        "Robust MAD modified-z: remove largest robust z if >= threshold",
-        "95% robust interval: remove most extreme outside median ± z*MAD_SD",
-    ],
-    index=1,
-)
-c1, c2, c3, c4 = st.columns(4)
-with c1:
-    max_remove_per_group = st.selectbox("Max outliers to remove per analyte/level/scope", [0, 1, 2], index=1)
-with c2:
-    gcrit_mode = st.selectbox("Gcrit mode", ["Manual Gcrit value", "Automatic from n, alpha, tail"], index=1)
-with c3:
-    gcrit = st.number_input("Manual Gcrit value", min_value=0.0, value=3.135, step=0.001, format="%.3f")
-with c4:
-    gcrit_alpha = st.number_input("Automatic Gcrit alpha", min_value=0.0001, max_value=0.2, value=0.01, step=0.001, format="%.4f")
+    normalization_method = st.selectbox(
+        "Longitudinal normalization protocol", NORMALIZATION_METHODS,
+        index=NORMALIZATION_METHODS.index("Combined paired correction: five-day reference + paired log-ratio"),
+        help="The default preserves the original app's selected combined correction. Each level is corrected independently.")
+    active_analyte_normalization_map = {}
+    norm_comparison = pd.DataFrame()
+    st.caption("The same normalization protocol is applied to each level separately. Adding or filtering another level cannot change this level's method. Normalization uses all QC-retained uploaded rows within each level; replicate/day output filters follow normalization.")
 
-c1, c2, c3 = st.columns(3)
-with c1:
-    gcrit_tail = st.selectbox("Automatic Gcrit tail", ["Two-sided", "One-sided"], index=0)
-with c2:
-    modified_z_threshold = st.number_input("MAD modified-z threshold", min_value=0.1, value=3.5, step=0.1)
-with c3:
-    robust_interval_z = st.number_input("Robust interval z", min_value=0.5, value=1.96, step=0.01)
+    # Final reporting is intentionally single-path, matching the supplied Results workbook.
+    # Paired reference/bias calculations are still used internally for normalization assessment,
+    # but only the normalized device precision outcome is reported as the final analyte result.
+    value_output_modes = ["Device normalized value"]
+    st.caption("Final precision output: one normalized device result per selected analyte/model (no competing reference/bias result tables).")
 
-expected_n_single_device = len(days) * len(replicates)
-expected_n_pooled = len(days) * len(replicates) * len(devices)
-st.caption(
-    f"UI design target: single-device N = {len(days)} × {len(replicates)} = **{expected_n_single_device}**; pooled N = {len(days)} × {len(replicates)} × {len(devices)} = **{expected_n_pooled}**. "
-    "For combined files the calculation uses the actual selected Day × Replicate × Device design within each Level, preventing unrelated levels from inflating expected N."
-)
-st.markdown("""
-**Assumption-aware testing:** each analyte/level/scope now receives Shapiro-Wilk normality testing and Levene variance testing.  
-If assumptions pass, the app attempts the parametric MixedLM precision estimate. If assumptions fail or the model cannot fit, it uses robust MAD-based precision.  
-**Outlier default:** automatic outlier handling uses Grubbs only when Shapiro-Wilk supports normality; otherwise it uses robust MAD.
-""")
+    st.subheader("Additional raw analyte columns, optional")
+    observed_candidate_cols = [c for c in df_eligible_ui.columns if c not in REQUIRED_BASE_COLS]
+    extra_analytes = st.multiselect(
+        "Optional: also analyze raw columns directly without paired normalization",
+        options=sorted(observed_candidate_cols),
+        default=[],
+    )
 
-# Validation is run after normalized columns are generated.
-placeholder_cfg = Config(
-    analytes=extra_analytes,
-    levels=levels,
-    days=days,
-    replicates=[int(r) for r in replicates],
-    devices=devices,
-    gcrit=float(gcrit),
-    expected_n=int(expected_n_single_device),
-    device_mode=device_mode,
-    outlier_method=outlier_method,
-    max_remove_per_group=int(max_remove_per_group),
-    gcrit_mode=gcrit_mode,
-    gcrit_alpha=float(gcrit_alpha),
-    gcrit_tail=gcrit_tail,
-    modified_z_threshold=float(modified_z_threshold),
-    robust_interval_z=float(robust_interval_z),
-    do_bootstrap_ci=bool(do_bootstrap_ci),
-    n_boot=int(n_boot),
-    seed=int(seed),
-    paired_analytes=paired_analytes,
-    normalization_method=normalization_method,
-    value_output_modes=value_output_modes,
-    analyte_pair_map=selected_pair_map,
-    analyte_normalization_map=active_analyte_normalization_map,
-)
-try:
-    df_check, analysis_analytes_check, _ = build_analysis_dataframe(df_eligible_ui, placeholder_cfg)
-    ok, msg = validate_and_standardize(df_check, analysis_analytes_check)
-except Exception as e:
-    ok, msg = False, str(e)
+    st.subheader("Analysis settings")
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        device_mode = st.selectbox("Device handling", ["Pool all devices", "Analyze each device separately + pooled"])
+    with c2:
+        do_bootstrap_ci = st.checkbox("Bootstrap 95% CIs", value=False)
+    with c3:
+        n_boot = st.number_input("Bootstrap iterations", min_value=200, max_value=20000, value=2000, step=200)
+    with c4:
+        seed = st.number_input("Random seed", min_value=1, max_value=999999, value=123, step=1)
 
-if not ok:
-    st.error(msg)
-    st.stop()
+    st.subheader("Optional outlier detection")
+    outlier_method = st.selectbox(
+        "Outlier method for cleaned/sensitivity results",
+        [
+            "None",
+            "Automatic: Grubbs if Shapiro normal, otherwise Robust MAD",
+            "Gcrit Grubbs-like: remove largest |value-mean|/SD if >= Gcrit",
+            "Robust MAD modified-z: remove largest robust z if >= threshold",
+            "95% robust interval: remove most extreme outside median ± z*MAD_SD",
+        ],
+        index=1,
+    )
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        max_remove_per_group = st.selectbox("Max outliers to remove per analyte/level/scope", [0, 1, 2], index=1)
+    with c2:
+        gcrit_mode = st.selectbox("Gcrit mode", ["Manual Gcrit value", "Automatic from n, alpha, tail"], index=1)
+    with c3:
+        gcrit = st.number_input("Manual Gcrit value", min_value=0.0, value=3.135, step=0.001, format="%.3f")
+    with c4:
+        gcrit_alpha = st.number_input("Automatic Gcrit alpha", min_value=0.0001, max_value=0.2, value=0.01, step=0.001, format="%.4f")
 
-run_btn = st.button("Run EP05 analysis", type="primary")
-if run_btn:
-    if len(levels) == 0 or len(days) == 0 or len(replicates) == 0 or len(devices) == 0:
-        st.error("Please select at least one Level, Day, Replicate, and Device.")
-        st.stop()
-    if len(selected_pair_map) == 0 and len(extra_analytes) == 0:
-        st.error("Please select at least one paired analyte or raw analyte column.")
-        st.stop()
-    if len(value_output_modes) == 0 and len(selected_pair_map) > 0:
-        st.error("Please select at least one paired metric to analyze.")
-        st.stop()
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        gcrit_tail = st.selectbox("Automatic Gcrit tail", ["Two-sided", "One-sided"], index=0)
+    with c2:
+        modified_z_threshold = st.number_input("MAD modified-z threshold", min_value=0.1, value=3.5, step=0.1)
+    with c3:
+        robust_interval_z = st.number_input("Robust interval z", min_value=0.5, value=1.96, step=0.01)
 
-    cfg = Config(
+    expected_n_single_device = len(days) * len(replicates)
+    expected_n_pooled = len(days) * len(replicates) * len(devices)
+    st.caption(
+        f"UI design target: single-device N = {len(days)} × {len(replicates)} = **{expected_n_single_device}**; pooled N = {len(days)} × {len(replicates)} × {len(devices)} = **{expected_n_pooled}**. "
+        "For combined files the calculation uses the actual selected Day × Replicate × Device design within each Level, preventing unrelated levels from inflating expected N."
+    )
+    st.markdown("""
+    **Assumption-aware testing:** each analyte/level/scope now receives Shapiro-Wilk normality testing and Levene variance testing.  
+    If assumptions pass, the app attempts the parametric MixedLM precision estimate. If assumptions fail or the model cannot fit, it uses robust MAD-based precision.  
+    **Outlier default:** automatic outlier handling uses Grubbs only when Shapiro-Wilk supports normality; otherwise it uses robust MAD.
+    """)
+
+    # Validation is run after normalized columns are generated.
+    placeholder_cfg = Config(
         analytes=extra_analytes,
         levels=levels,
         days=days,
@@ -1681,34 +1749,85 @@ if run_btn:
         value_output_modes=value_output_modes,
         analyte_pair_map=selected_pair_map,
         analyte_normalization_map=active_analyte_normalization_map,
-        global_flag_col=None if global_flag_col == "None" else global_flag_col,
-        treat_all_global_false=bool(treat_all_global_false),
     )
+    try:
+        df_check, analysis_analytes_check, _ = build_analysis_dataframe(df_eligible_ui, placeholder_cfg)
+        ok, msg = validate_and_standardize(df_check, analysis_analytes_check)
+    except Exception as e:
+        ok, msg = False, str(e)
 
-    if (not cfg.treat_all_global_false) and (not cfg.global_flag_col):
-        st.error("Select a Global flag column, or tick the option to treat all rows as global_flag = FALSE.")
+    if not ok:
+        st.error(msg)
         st.stop()
 
-    with st.spinner("Running analysis, excluding global_flag=TRUE rows, and creating the combined workbook..."):
-        excel_bytes = run_pipeline_to_excel(df, cfg)
+    run_btn = st.button("Run EP05 analysis", type="primary")
+    if run_btn:
+        if len(levels) == 0 or len(days) == 0 or len(replicates) == 0 or len(devices) == 0:
+            st.error("Please select at least one Level, Day, Replicate, and Device.")
+            st.stop()
+        if len(selected_pair_map) == 0 and len(extra_analytes) == 0:
+            st.error("Please select at least one paired analyte or raw analyte column.")
+            st.stop()
+        if len(value_output_modes) == 0 and len(selected_pair_map) > 0:
+            st.error("Please select at least one paired metric to analyze.")
+            st.stop()
 
-    st.success("Done. All results and audit tables are in one Excel workbook.")
-    try:
-        _preview_results = pd.read_excel(io.BytesIO(excel_bytes), sheet_name="Results", engine="openpyxl")
-        _preview_counts = pd.read_excel(io.BytesIO(excel_bytes), sheet_name="Row Cell Counts", engine="openpyxl")
-        _preview_samples = pd.read_excel(io.BytesIO(excel_bytes), sheet_name="Per-Sample CV", engine="openpyxl")
-        st.markdown("### Reproducibility precision by level")
-        st.dataframe(_preview_results, use_container_width=True, hide_index=True)
-        st.markdown("### Row counts before/after statistical outlier removal")
-        st.dataframe(_preview_counts, use_container_width=True, hide_index=True)
-        st.markdown("### Per-sample CV")
-        st.caption("For current EP05 files, each Blood Sample ID usually spans one day/replicate and multiple devices; therefore CV across devices is shown. A per-sample CV_total is reported only when the same sample ID spans multiple days.")
-        st.dataframe(_preview_samples, use_container_width=True, hide_index=True)
-    except Exception:
-        pass
-    st.download_button(
-        label="Download combined Excel results",
-        data=excel_bytes,
-        file_name="imprecision_long_results.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+        cfg = Config(
+            analytes=extra_analytes,
+            levels=levels,
+            days=days,
+            replicates=[int(r) for r in replicates],
+            devices=devices,
+            gcrit=float(gcrit),
+            expected_n=int(expected_n_single_device),
+            device_mode=device_mode,
+            outlier_method=outlier_method,
+            max_remove_per_group=int(max_remove_per_group),
+            gcrit_mode=gcrit_mode,
+            gcrit_alpha=float(gcrit_alpha),
+            gcrit_tail=gcrit_tail,
+            modified_z_threshold=float(modified_z_threshold),
+            robust_interval_z=float(robust_interval_z),
+            do_bootstrap_ci=bool(do_bootstrap_ci),
+            n_boot=int(n_boot),
+            seed=int(seed),
+            paired_analytes=paired_analytes,
+            normalization_method=normalization_method,
+            value_output_modes=value_output_modes,
+            analyte_pair_map=selected_pair_map,
+            analyte_normalization_map=active_analyte_normalization_map,
+            global_flag_col=None if global_flag_col == "None" else global_flag_col,
+            treat_all_global_false=bool(treat_all_global_false),
+        )
+
+        if (not cfg.treat_all_global_false) and (not cfg.global_flag_col):
+            st.error("Select a Global flag column, or tick the option to treat all rows as global_flag = FALSE.")
+            st.stop()
+
+        with st.spinner("Running analysis, excluding global_flag=TRUE rows, and creating the combined workbook..."):
+            excel_bytes = run_pipeline_to_excel(df, cfg)
+
+        st.success("Done. All results and audit tables are in one Excel workbook.")
+        try:
+            _preview_results = pd.read_excel(io.BytesIO(excel_bytes), sheet_name="Results", engine="openpyxl")
+            _preview_counts = pd.read_excel(io.BytesIO(excel_bytes), sheet_name="Row Cell Counts", engine="openpyxl")
+            _preview_samples = pd.read_excel(io.BytesIO(excel_bytes), sheet_name="Per-Sample CV", engine="openpyxl")
+            st.markdown("### Reproducibility precision by level")
+            st.dataframe(_preview_results, use_container_width=True, hide_index=True)
+            st.markdown("### Row counts before/after statistical outlier removal")
+            st.dataframe(_preview_counts, use_container_width=True, hide_index=True)
+            st.markdown("### Per-sample CV")
+            st.caption("For current EP05 files, each Blood Sample ID usually spans one day/replicate and multiple devices; therefore CV across devices is shown. A per-sample CV_total is reported only when the same sample ID spans multiple days.")
+            st.dataframe(_preview_samples, use_container_width=True, hide_index=True)
+        except Exception:
+            pass
+        st.download_button(
+            label="Download combined Excel results",
+            data=excel_bytes,
+            file_name="imprecision_long_results.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+
+if __name__ == "__main__":
+    main()
