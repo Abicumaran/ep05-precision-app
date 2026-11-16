@@ -19,16 +19,65 @@ import re
 import numpy as np
 import pandas as pd
 
-ANALYTE_ORDER = ['RBC', 'WBC_2', 'PLT_3', 'HCT', 'HGB', 'MCV_3', 'RDW_3',
+ANALYTE_ORDER = ['RBC', 'WBC_2_C', 'PLT_3_C', 'HCT_2', 'HGB', 'MCV_3', 'RDW_3',
                  'MCH', 'MCHC', 'NEUT_2', 'LYMPH_2', 'MXD_2']
-FALLBACKS = {'WBC_2': ['WBC'], 'PLT_3': ['PLT'], 'MCV_3': ['MCV'],
-             'RDW_3': ['RDW'], 'NEUT_2': ['NEU_2', 'NEUT', 'NEU'],
+FALLBACKS = {'WBC_2_C': ['WBC_2', 'WBC'], 'PLT_3_C': ['PLT_3', 'PLT'],
+             'HCT_2': ['HCT'], 'MCV_3': ['MCV'], 'RDW_3': ['RDW'],
+             'NEUT_2': ['NEU_2', 'NEUT', 'NEU'],
              'LYMPH_2': ['LYMPH'], 'MXD_2': ['MXD']}
 
 def default_analytes(columns):
     columns = set(columns)
     return [next(c for c in [a] + FALLBACKS.get(a, []) if c in columns)
             for a in ANALYTE_ORDER if any(c in columns for c in [a] + FALLBACKS.get(a, []))]
+
+def analyte_reference_column(column, columns):
+    """Suggest an existing reference, preferring an exact model-specific match."""
+    references = {str(c)[:-4].upper(): str(c) for c in columns
+                  if str(c).lower().endswith('_ref')}
+    name = str(column).upper()
+    if name in references:
+        return references[name]
+    matches = [base for base in references if name.startswith(base + '_')]
+    if matches:
+        return references[max(matches, key=len)]
+    # Both NEU and NEUT are used for neutrophils in existing input files.
+    for source, target in [('NEU', 'NEUT'), ('NEUT', 'NEU')]:
+        if (name == source or name.startswith(source + '_')) and target in references:
+            return references[target]
+    return None
+
+
+def detected_analyte_columns(df):
+    """Detect result columns, excluding identifiers, references and QC metadata."""
+    metadata = {
+        'batchid', 'originalbatchid', 'mbctestrecordid', 'sbctestrecordid',
+        'bloodsampleid', 'sampleid', 'donor', 'type', 'specimentype',
+        'level', 'condition', 'day', 'replicate', 'device', 'deviceid',
+        'serialnumber', 'devicealias', 'patientuserid', 'testkitid',
+        'collection', 'reprocessno', 'processed', 'numvalidimg',
+        'dilutioncorrectionfactor', 'referencematchcount', 'referencesource',
+        'ingestiondate', 'globalflag', 'flagcomments',
+    }
+    detected = []
+    for column in df.columns:
+        name = str(column)
+        lower = name.lower()
+        compact = re.sub(r'[^a-z0-9]', '', lower)
+        if (compact in metadata or lower.endswith(('_ref', '_flag'))
+                or lower.startswith(('div_', 'rule_', 'unnamed:'))
+                or re.search(r'(?:^|_)(?:flag|id|date|time|timestamp)(?:_|$)', lower)):
+            continue
+        values = df[column]
+        if (pd.api.types.is_bool_dtype(values)
+                or pd.api.types.is_datetime64_any_dtype(values)):
+            continue
+        if (analyte_reference_column(name, df.columns) is not None
+                or pd.to_numeric(values, errors='coerce').notna().any()):
+            detected.append(name)
+    preferred = default_analytes(detected)
+    return preferred + [c for c in detected if c not in preferred]
+
 
 def identifier(value):
     if pd.isna(value):
@@ -98,9 +147,9 @@ BASE_COL_ALIASES = {
 # NEUT_2/NEUT_ref are accepted because that is how the uploaded dataset labels them.
 DEFAULT_ANALYTE_PAIRS = {
     "RBC": ("RBC", "RBC_ref"),
-    "WBC": ("WBC_2", "WBC_ref"),
-    "PLT": (["PLT_3", "PLT"], "PLT_ref"),
-    "HCT": ("HCT", "HCT_ref"),
+    "WBC": (["WBC_2_C", "WBC_2", "WBC"], "WBC_ref"),
+    "PLT": (["PLT_3_C", "PLT_3", "PLT"], "PLT_ref"),
+    "HCT": (["HCT_2", "HCT"], "HCT_ref"),
     "HGB": ("HGB", "HGB_ref"),
     "MCV": (["MCV_3", "MCV"], "MCV_ref"),
     "RDW": (["RDW_3", "RDW"], "RDW_ref"),
@@ -242,28 +291,21 @@ def split_global_flag_rows(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame,
 
 
 def default_analyte_mapping_table(df: pd.DataFrame) -> pd.DataFrame:
-    """Editable starter map: validated defaults plus additional PLT model columns when present."""
-    rows = []
+    """Editable mappings for detected result columns, with preferred models first."""
     base_pairs = resolve_analyte_pairs(df)
-    for label, (dev_col, ref_col) in base_pairs.items():
-        rows.append({"Include": True, "Analyte": label, "Device column": dev_col, "Reference column": ref_col})
-
-    # Additional model columns can share the same validated reference analyte.
-    # This only expands user-selectable mappings; it does not alter the EP05 calculations.
-    extra_models = [
-        ("PLT_2", "PLT 2", "PLT_ref"),
-        ("PLT_3", "PLT 3", "PLT_ref"),
-        ("MCV_3", "MCV 3", "MCV_ref"),
-        ("RDW_3", "RDW 3", "RDW_ref"),
-    ]
-    for dev_col, label, ref_col in extra_models:
-        if dev_col in df.columns and ref_col in df.columns and not any(r["Device column"] == dev_col for r in rows):
-            rows.append({"Include": False, "Analyte": label, "Device column": dev_col, "Reference column": ref_col})
-
-    # Reorder starter rows to mirror the Short-Term analyte selector, then append
-    # any additional mappings that are not part of that preferred list.
-    order_index = {name: i for i, name in enumerate(DEFAULT_ANALYTE_COLUMN_ORDER)}
-    rows.sort(key=lambda r: (order_index.get(str(r["Device column"]), len(order_index)), str(r["Device column"])))
+    labels = {dev: label for label, (dev, ref) in base_pairs.items()}
+    extra_labels = {"PLT_2": "PLT 2", "PLT_3": "PLT 3", "MCV_3": "MCV 3", "RDW_3": "RDW 3"}
+    rows = []
+    for dev_col in detected_analyte_columns(df):
+        label = labels.get(dev_col, extra_labels.get(dev_col, dev_col))
+        if dev_col not in labels and label in labels.values():
+            label = f"{dev_col} (additional model)"
+        rows.append({
+            "Include": True,
+            "Analyte": label,
+            "Device column": dev_col,
+            "Reference column": analyte_reference_column(dev_col, df.columns) or "",
+        })
     return pd.DataFrame(rows, columns=["Include", "Analyte", "Device column", "Reference column"])
 
 
@@ -1603,7 +1645,7 @@ def main():
         df_eligible_ui = df_eligible_ui[_ui_reps.isin([int(x) for x in replicates])].copy()
 
     st.subheader("Paired analytes and normalization")
-    mapping_seed_all = default_analyte_mapping_table(df_eligible_ui)
+    mapping_seed_all = default_analyte_mapping_table(df)
 
     # Explicit analyte/model selector, matching the Short-Term app behavior.
     # Options and selected tags are shown as uploaded device-result column names.
@@ -1611,14 +1653,15 @@ def main():
         detected_model_cols = mapping_seed_all["Device column"].astype(str).tolist()
     else:
         detected_model_cols = []
-    preferred_present = [c for c in DEFAULT_ANALYTE_COLUMN_ORDER if c in detected_model_cols]
+    preferred_present = default_analytes(detected_model_cols)
     ordered_model_options = preferred_present + [c for c in detected_model_cols if c not in preferred_present]
     selected_model_cols = st.multiselect(
         "Analyte/model columns to analyze",
         options=ordered_model_options,
-        default=default_analytes(detected_model_cols),
-        help="Choose exactly which analyte/model result columns to include. The suggested order matches the Short-Term app.",
+        default=default_analytes(detected_model_cols) or [c for c in detected_model_cols if analyte_reference_column(c, df.columns)],
+        help="Detected result columns are listed in the preferred order, followed by additional columns from your upload. Select more models here or add a mapping below.",
     )
+    selected_model_cols = [c for c in ordered_model_options if c in selected_model_cols]
     mapping_seed = mapping_seed_all[mapping_seed_all["Device column"].astype(str).isin(selected_model_cols)].copy()
     if not mapping_seed.empty:
         selected_order = {name: i for i, name in enumerate(selected_model_cols)}
@@ -1626,8 +1669,9 @@ def main():
         mapping_seed = mapping_seed.sort_values("__order").drop(columns="__order").reset_index(drop=True)
 
     st.caption("Edit this table to add or remove analyzer models. Multiple models may share the same reference column (for example PLT, PLT 2 and PLT 3 can all use PLT_ref).")
-    device_measure_options = [c for c in df_eligible_ui.columns if pd.to_numeric(df_eligible_ui[c], errors="coerce").notna().sum() >= 3]
-    reference_options = [c for c in df_eligible_ui.columns if c.lower().endswith("_ref")]
+    device_measure_options = detected_analyte_columns(df)
+    reference_options = [c for c in df.columns if c.lower().endswith("_ref")]
+    reference_options += [c for c in df.columns if c not in reference_options]
     mapping_table = st.data_editor(
         mapping_seed,
         num_rows="dynamic",
@@ -1642,6 +1686,11 @@ def main():
         key="analyte_mapping_editor",
     )
     selected_pair_map = parse_analyte_mapping_table(mapping_table, df_eligible_ui)
+    unmapped = [str(r["Device column"]) for _, r in mapping_table.iterrows()
+                if normalize_bool(r.get("Include", False))
+                and (r.get("Device column") not in df.columns or r.get("Reference column") not in df.columns)]
+    if unmapped:
+        st.warning("Choose a device and matched reference column for: " + ", ".join(unmapped))
     paired_analytes = list(selected_pair_map.keys())
     if selected_pair_map:
         st.dataframe(pd.DataFrame([{"Analyte": k, "Device column": v[0], "Reference column": v[1]} for k, v in selected_pair_map.items()]), use_container_width=True)
